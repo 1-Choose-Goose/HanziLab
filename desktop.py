@@ -1,0 +1,1212 @@
+from __future__ import annotations
+
+import ctypes
+import html
+import re
+import sys
+import unicodedata
+from functools import cache, lru_cache
+from pathlib import Path
+
+from pypinyin import Style, lazy_pinyin
+from pypinyin.constants import PINYIN_DICT
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QRunnable,
+    QSettings,
+    QSize,
+    Qt,
+    QThreadPool,
+    QTimer,
+    Signal,
+    Slot,
+)
+from PySide6.QtGui import QFont, QFontDatabase, QIcon
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSplitter,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from copybook_pdf import (
+    CopybookError,
+    generate_hanzi_copybook,
+    suggested_copybook_name,
+)
+from database import DB_PATH, get_examples, get_stats, search_entries, warm_search_index
+from handwriting_view import HandwritingDialog
+from stroke_order import StrokeOrderPanel
+from study_database import StudyRepository
+from study_view import StudyPage
+from text_formatting import mixed_script_html, normalize_display_text
+
+APP_TITLE = "HanziLab — китайско-русский словарь"
+FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+ICON_DIR = Path(__file__).resolve().parent / "assets" / "icons"
+APP_ICON_PNG = ICON_DIR / "hanzilab.png"
+APP_ICON_ICO = ICON_DIR / "hanzilab.ico"
+KAITI_FAMILY = "KaiTi"
+XINGSHU_FAMILY = "QXyingbixing"
+INPUT_KAITI_FAMILY = "HanziLab KaiTi CJK"
+RUSSIAN_FONT_FAMILY = "Times New Roman"
+CJK_PATTERN = re.compile(r"[\u3400-\u9fff]")
+
+
+class BackgroundTaskSignals(QObject):
+    finished = Signal(int, object, object)
+
+
+class BackgroundTask(QRunnable):
+    """Выполняет тяжёлое чтение SQLite, не блокируя Qt-интерфейс."""
+
+    def __init__(
+        self,
+        generation: int,
+        function,
+        *arguments,
+        category: str = "general",
+    ) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.generation = generation
+        self.function = function
+        self.arguments = arguments
+        self.category = category
+        self.cancelled = False
+        self.signals = BackgroundTaskSignals()
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    @Slot()
+    def run(self) -> None:
+        if self.cancelled:
+            self.signals.finished.emit(
+                self.generation, None, RuntimeError("background task cancelled")
+            )
+            return
+        try:
+            result = self.function(*self.arguments)
+            error = None
+        except Exception as exception:  # noqa: BLE001 - граница фоновой задачи.
+            result = None
+            error = exception
+        if self.cancelled:
+            result = None
+            error = RuntimeError("background task cancelled")
+        self.signals.finished.emit(self.generation, result, error)
+
+
+def _pinyin_base(text: str) -> str:
+    normalized = unicodedata.normalize("NFD", text.lower().replace("ü", "v"))
+    letters: list[str] = []
+    for character in normalized:
+        if character == "\N{COMBINING DIAERESIS}" and letters:
+            if letters[-1] == "u":
+                letters[-1] = "v"
+        elif not unicodedata.combining(character) and character.isalpha():
+            letters.append(character)
+    return "".join(letters)
+
+
+@lru_cache(maxsize=1)
+def _valid_pinyin_syllables() -> frozenset[str]:
+    syllables = {
+        _pinyin_base(reading)
+        for readings in PINYIN_DICT.values()
+        for reading in readings.split(",")
+    }
+    return frozenset(syllable for syllable in syllables if syllable)
+
+
+def _split_compact_pinyin(value: str, syllable_count: int) -> list[str] | None:
+    compact = _pinyin_base(value)
+    valid = _valid_pinyin_syllables()
+
+    @cache
+    def split(position: int, remaining: int) -> tuple[str, ...] | None:
+        if position == len(compact):
+            return () if remaining == 0 else None
+        if remaining <= 0:
+            return None
+        for end in range(min(len(compact), position + 7), position, -1):
+            candidate = compact[position:end]
+            is_erhua = candidate.endswith("r") and candidate[:-1] in valid
+            if candidate not in valid and not is_erhua:
+                continue
+            tail = split(end, remaining - 1)
+            if tail is not None:
+                return (candidate, *tail)
+        return None
+
+    bases = split(0, syllable_count)
+    return list(bases) if bases is not None else None
+
+
+def readable_pinyin(hanzi: str, pinyin: str) -> str:
+    """Разделяет слитный пиньинь, не подменяя сохранённые чтения и тоны."""
+    hanzi = normalize_display_text(hanzi, preserve_line_breaks=False)
+    value = normalize_display_text(pinyin, preserve_line_breaks=False)
+    hanzi_characters = CJK_PATTERN.findall(hanzi)
+    if " " in value or len(hanzi_characters) < 2:
+        return value
+    generated_bases = [
+        normalized
+        for syllable in lazy_pinyin(
+            hanzi, style=Style.TONE, neutral_tone_with_five=False
+        )
+        if (normalized := _pinyin_base(syllable))
+    ]
+    if _pinyin_base(value) != "".join(generated_bases):
+        syllable_count = len(hanzi_characters)
+        if hanzi_characters[-1] == "儿" and _pinyin_base(value).endswith("r"):
+            syllable_count -= 1
+        generated_bases = _split_compact_pinyin(value, syllable_count) or []
+    if not generated_bases:
+        return value
+
+    # Границы берём из pypinyin, но сами слоги вырезаем из сохранённого
+    # чтения: так не теряются словарные тоны (например 一: yī вместо yí).
+    source = unicodedata.normalize("NFC", value)
+    position = 0
+    separated: list[str] = []
+    for generated_base in generated_bases:
+        while position < len(source) and not _pinyin_base(source[position]):
+            position += 1
+        start = position
+        consumed = 0
+        while position < len(source) and consumed < len(generated_base):
+            consumed += len(_pinyin_base(source[position]))
+            position += 1
+        while position < len(source) and source[position].isdigit():
+            position += 1
+        syllable = re.sub(r"[\s'’·-]+", "", source[start:position])
+        if not syllable or consumed != len(generated_base):
+            return value
+        separated.append(syllable)
+    return (
+        " ".join(separated)
+        if _pinyin_base("".join(separated)) == _pinyin_base(value)
+        else value
+    )
+
+
+def load_chinese_fonts() -> None:
+    for filename in ("KaiTi.ttf", "xingshu.ttf", "HanziLabKaiTiCJK.ttf"):
+        path = FONT_DIR / filename
+        if path.exists():
+            QFontDatabase.addApplicationFont(str(path))
+
+
+def mixed_text_font(chinese_family: str, size: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
+    # Список из китайской и латинской семей заставляет Qt растягивать кириллицу
+    # по метрикам китайского шрифта. Один Times New Roman сохраняет нормальный
+    # интервал, а отсутствующие китайские глифы Qt подбирает через системный fallback.
+    return QFont(RUSSIAN_FONT_FAMILY, size, weight)
+
+
+class ElidedLabel(QLabel):
+    def __init__(self, text: str = "") -> None:
+        super().__init__()
+        self.full_text = text
+        self.setMinimumWidth(0)
+        self.setToolTip(text)
+
+    def update_elision(self) -> None:
+        available = max(0, self.contentsRect().width())
+        QLabel.setText(
+            self,
+            self.fontMetrics().elidedText(
+                self.full_text, Qt.TextElideMode.ElideRight, available
+            ),
+        )
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.update_elision()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange:
+            self.update_elision()
+
+
+class ResultRow(QWidget):
+    def __init__(self, result: dict, hanzi_font_family: str = KAITI_FAMILY) -> None:
+        super().__init__()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 10, 18, 10)
+        layout.setSpacing(16)
+
+        hanzi_text = normalize_display_text(
+            result["hanzi"], preserve_line_breaks=False
+        )
+        pinyin_source = normalize_display_text(
+            result["pinyin"], preserve_line_breaks=False
+        )
+        hanzi = QLabel(hanzi_text)
+        hanzi.setObjectName("resultHanzi")
+        character_count = len(CJK_PATTERN.findall(hanzi_text))
+        hanzi_size = 16 if character_count <= 4 else 14 if character_count <= 6 else 12
+        hanzi.setFont(QFont(hanzi_font_family, hanzi_size, QFont.Weight.DemiBold))
+        hanzi.setFixedWidth(120)
+        hanzi.setMaximumHeight(58)
+        hanzi.setWordWrap(True)
+        hanzi.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        hanzi.setToolTip(hanzi_text)
+
+        text = QVBoxLayout()
+        text.setSpacing(4)
+        pinyin_text = readable_pinyin(hanzi_text, pinyin_source)
+        pinyin = ElidedLabel(pinyin_text)
+        pinyin.setObjectName("resultPinyin")
+        translation_text = normalize_display_text(
+            result["translation"], preserve_line_breaks=False
+        )
+        translation_words = translation_text.split()
+        translation_preview = " ".join(translation_words[:3])
+        if len(translation_words) > 3:
+            translation_preview += "…"
+        translation = QLabel(translation_preview)
+        translation.setObjectName("resultTranslation")
+        translation.setFont(mixed_text_font(hanzi_font_family, 11))
+        translation.setToolTip(translation_text)
+        translation.setWordWrap(True)
+        translation.setMaximumHeight(36)
+        text.addWidget(pinyin)
+        text.addWidget(translation)
+        text.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        layout.addWidget(hanzi)
+        layout.addLayout(text, 1)
+
+
+class HanziLabWindow(QMainWindow):
+    def __init__(self, study_repository: StudyRepository | None = None) -> None:
+        super().__init__()
+        self.results: list[dict] = []
+        self.current_result: dict | None = None
+        self.pending_result: dict | None = None
+        self.current_examples: list[dict] = []
+        self.search_generation = 0
+        self.examples_generation = 0
+        self.closing = False
+        self.background_pool = QThreadPool(self)
+        self.background_pool.setMaxThreadCount(3)
+        self.background_tasks: set[BackgroundTask] = set()
+        self.study_repository = study_repository or StudyRepository()
+        self.settings = QSettings("HanziLab", "HanziLab")
+        font_default_version = self.settings.value("font_default_version", 0, type=int)
+        if font_default_version < 1:
+            saved_font = KAITI_FAMILY
+            self.settings.setValue("hanzi_font", KAITI_FAMILY)
+            self.settings.setValue("font_default_version", 1)
+        else:
+            saved_font = self.settings.value("hanzi_font", KAITI_FAMILY, type=str)
+        self.hanzi_font_family = saved_font if saved_font in {KAITI_FAMILY, XINGSHU_FAMILY} else KAITI_FAMILY
+        self.setWindowTitle(APP_TITLE)
+        self.setWindowIcon(QIcon(str(APP_ICON_PNG)))
+        self.resize(1180, 780)
+        self.setMinimumSize(900, 640)
+
+        root = QWidget()
+        root.setObjectName("root")
+        self.setCentralWidget(root)
+        shell = QHBoxLayout(root)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+        shell.addWidget(self.create_sidebar())
+        self.page_stack = QStackedWidget()
+        self.page_stack.setObjectName("pageStack")
+        self.page_stack.addWidget(self.create_content())
+        self.page_stack.addWidget(self.create_cards_page())
+        shell.addWidget(self.page_stack, 1)
+
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(280)
+        self.search_timer.timeout.connect(self.run_search)
+        self.search_warmup_started = False
+        self.search_warmup_timer = QTimer(self)
+        self.search_warmup_timer.setSingleShot(True)
+        self.search_warmup_timer.setInterval(700)
+        self.search_warmup_timer.timeout.connect(self.start_search_warmup)
+        self.search_input.textChanged.connect(self.on_search_text_changed)
+        self.search_input.returnPressed.connect(self.run_search)
+        self.show_empty_state()
+
+    def schedule_search_warmup(self) -> None:
+        """Прогреть FTS после показа окна, не задерживая запуск интерфейса."""
+        if not self.closing and not self.search_warmup_started:
+            self.search_warmup_timer.start()
+
+    def start_search_warmup(self) -> None:
+        if (
+            self.closing
+            or self.search_warmup_started
+            or self.search_input.text().strip()
+        ):
+            return
+        self.search_warmup_started = True
+        self.start_background_task(
+            BackgroundTask(0, warm_search_index, category="warmup")
+        )
+
+    def create_sidebar(self) -> QWidget:
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(224)
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(24, 28, 24, 24)
+        layout.setSpacing(8)
+
+        brand = QHBoxLayout()
+        brand.setSpacing(11)
+        # The brand mark is the character 汉 in the bundled XingShu font.
+        # Keep it rendered natively so its calligraphic outline is never
+        # distorted by bitmap scaling in the sidebar.
+        seal = QLabel("汉")
+        seal.setObjectName("seal")
+        seal.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        seal.setFont(QFont(XINGSHU_FAMILY, 18, QFont.Weight.Bold))
+        seal.setFixedSize(38, 38)
+        name = QLabel("HanziLab")
+        name.setObjectName("brandName")
+        brand.addWidget(seal)
+        brand.addWidget(name)
+        brand.addStretch()
+        layout.addLayout(brand)
+        layout.addSpacing(36)
+
+        section = QLabel("ОБУЧЕНИЕ")
+        section.setObjectName("sidebarSection")
+        layout.addWidget(section)
+
+        self.dictionary_button = QPushButton("Словарь")
+        self.dictionary_button.setObjectName("navActive")
+        self.dictionary_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dictionary_button.clicked.connect(lambda: self.show_page(0))
+        layout.addWidget(self.dictionary_button)
+
+        self.cards_button = QPushButton()
+        self.cards_button.setObjectName("navButton")
+        self.cards_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cards_button.clicked.connect(lambda: self.show_page(1))
+        self.update_cards_button(self.study_repository.get_card_count())
+        layout.addWidget(self.cards_button)
+
+        reviews = QPushButton("Повторение")
+        reviews.setObjectName("navDisabled")
+        reviews.setToolTip("Появится на следующем этапе")
+        reviews.setEnabled(False)
+        layout.addWidget(reviews)
+        layout.addStretch()
+
+        font_label = QLabel("ШРИФТ ИЕРОГЛИФОВ")
+        font_label.setObjectName("sidebarSection")
+        layout.addWidget(font_label)
+        self.font_selector = QComboBox()
+        self.font_selector.setObjectName("fontSelector")
+        self.font_selector.addItem("KaiTi · 楷体", KAITI_FAMILY)
+        self.font_selector.addItem("XingShu · 行书", XINGSHU_FAMILY)
+        selected_index = self.font_selector.findData(self.hanzi_font_family)
+        self.font_selector.setCurrentIndex(max(selected_index, 0))
+        self.font_selector.currentIndexChanged.connect(self.change_hanzi_font)
+        layout.addWidget(self.font_selector)
+        layout.addSpacing(12)
+
+        stats = get_stats()
+        local = QLabel(f"Локальная база\n{stats['entries']:,} слов".replace(",", " "))
+        local.setObjectName("localStatus")
+        layout.addWidget(local)
+        return sidebar
+
+    def show_page(self, index: int) -> None:
+        self.page_stack.setCurrentIndex(index)
+        self.dictionary_button.setObjectName("navActive" if index == 0 else "navButton")
+        self.cards_button.setObjectName("navActive" if index == 1 else "navButton")
+        for button in (self.dictionary_button, self.cards_button):
+            button.style().unpolish(button)
+            button.style().polish(button)
+        if index == 1:
+            self.study_page.activate()
+        else:
+            self.study_page.deactivate()
+
+    def update_cards_button(self, count: int) -> None:
+        self.cards_button.setText(f"Карточки · {count}" if count else "Карточки")
+
+    def create_cards_page(self) -> QWidget:
+        self.study_page = StudyPage(
+            self.study_repository,
+            get_examples,
+            self.hanzi_font_family,
+            RUSSIAN_FONT_FAMILY,
+            readable_pinyin,
+        )
+        self.study_page.card_count_changed.connect(self.update_cards_button)
+        self.study_page.cards_changed.connect(self.refresh_current_card_button)
+        return self.study_page
+
+    def create_content(self) -> QWidget:
+        content = QWidget()
+        content.setObjectName("content")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(38, 30, 38, 32)
+        layout.setSpacing(0)
+
+        header = QHBoxLayout()
+        heading_box = QVBoxLayout()
+        heading_box.setSpacing(4)
+        heading = QLabel("Словарь")
+        heading.setObjectName("pageTitle")
+        subtitle = QLabel("Поиск по иероглифам, пиньиню и русскому переводу")
+        subtitle.setObjectName("pageSubtitle")
+        heading_box.addWidget(heading)
+        heading_box.addWidget(subtitle)
+        header.addLayout(heading_box)
+        header.addStretch()
+        layout.addLayout(header)
+        layout.addSpacing(24)
+
+        search_shell = QFrame()
+        search_shell.setObjectName("searchShell")
+        search_layout = QHBoxLayout(search_shell)
+        search_layout.setContentsMargins(18, 4, 8, 4)
+        self.search_input = QLineEdit()
+        self.search_input.setObjectName("searchInput")
+        input_font = QFont()
+        input_font.setFamilies([INPUT_KAITI_FAMILY, RUSSIAN_FONT_FAMILY])
+        input_font.setPointSize(13)
+        self.search_input.setFont(input_font)
+        self.search_input.setPlaceholderText("Введите 学习, xuéxí или «учиться»")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.search_input.customContextMenuRequested.connect(self.show_edit_menu)
+        self.search_input.setMinimumHeight(60)
+        search_layout.addWidget(self.search_input, 1)
+        handwriting_button = QPushButton("✎")
+        handwriting_button.setObjectName("handwritingButton")
+        handwriting_button.setFont(QFont(RUSSIAN_FONT_FAMILY, 18))
+        handwriting_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        handwriting_button.setToolTip("Нарисовать иероглиф")
+        handwriting_button.clicked.connect(self.open_handwriting_input)
+        search_layout.addWidget(handwriting_button)
+        search_button = QPushButton("Найти")
+        search_button.setObjectName("searchButton")
+        search_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        search_button.clicked.connect(self.run_search)
+        search_layout.addWidget(search_button)
+        layout.addWidget(search_shell)
+        layout.addSpacing(18)
+
+        result_line = QHBoxLayout()
+        self.result_title = QLabel("Начните поиск")
+        self.result_title.setObjectName("resultTitle")
+        self.result_count = QLabel("")
+        self.result_count.setObjectName("resultCount")
+        result_line.addWidget(self.result_title)
+        result_line.addStretch()
+        result_line.addWidget(self.result_count)
+        layout.addLayout(result_line)
+        layout.addSpacing(10)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setObjectName("resultSplitter")
+        splitter.setChildrenCollapsible(False)
+
+        self.result_list = QListWidget()
+        self.result_list.setObjectName("resultList")
+        self.result_list.setMinimumWidth(390)
+        self.result_list.currentRowChanged.connect(self.show_result)
+        splitter.addWidget(self.result_list)
+
+        self.detail_stack = QStackedWidget()
+        self.detail_stack.setObjectName("detailStack")
+        self.detail_stack.addWidget(self.create_empty_detail())
+        self.detail_stack.addWidget(self.create_detail())
+        splitter.addWidget(self.detail_stack)
+        splitter.setSizes([460, 560])
+        layout.addWidget(splitter, 1)
+        return content
+
+    def open_handwriting_input(self) -> None:
+        dialog = HandwritingDialog(self.hanzi_font_family, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        text = dialog.selected_text()
+        if not text:
+            return
+        self.search_input.insert(text)
+        self.search_input.setFocus()
+
+    def create_empty_detail(self) -> QWidget:
+        empty = QFrame()
+        empty.setObjectName("emptyDetail")
+        layout = QVBoxLayout(empty)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark = QLabel("查")
+        self.empty_mark = mark
+        mark.setObjectName("emptyMark")
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setFont(QFont(self.hanzi_font_family, 54, QFont.Weight.Normal))
+        title = QLabel("Найдите нужное слово")
+        title.setObjectName("emptyTitle")
+        layout.addWidget(mark)
+        layout.addSpacing(10)
+        layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignCenter)
+        return empty
+
+    def create_detail(self) -> QWidget:
+        self.detail_scroll = QScrollArea()
+        self.detail_scroll.setObjectName("detailScroll")
+        self.detail_scroll.setWidgetResizable(True)
+        self.detail_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.detail_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        detail = QFrame()
+        detail.setObjectName("detail")
+        layout = QVBoxLayout(detail)
+        layout.setContentsMargins(38, 34, 38, 34)
+        layout.setSpacing(10)
+
+        eyebrow = QLabel("СЛОВАРНАЯ СТАТЬЯ")
+        eyebrow.setObjectName("detailEyebrow")
+        self.add_card_button = QPushButton("＋ Добавить в карточки")
+        self.add_card_button.setObjectName("addCardButton")
+        self.add_card_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_card_button.clicked.connect(self.add_current_card)
+        self.detail_hanzi = QLabel()
+        self.detail_hanzi.setObjectName("detailHanzi")
+        self.detail_hanzi.setFont(QFont(self.hanzi_font_family, 52, QFont.Weight.Bold))
+        self.detail_hanzi.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.copybook_button = QPushButton("Создать прописи")
+        self.copybook_button.setObjectName("createCopybookButton")
+        self.copybook_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.copybook_button.setToolTip(
+            "Создать PDF с порядком черт и клетками для тренировки"
+        )
+        self.copybook_button.clicked.connect(self.create_copybook_pdf)
+        self.detail_pinyin = QLabel()
+        self.detail_pinyin.setObjectName("detailPinyin")
+        self.detail_pinyin.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        divider = QFrame()
+        divider.setObjectName("divider")
+        divider.setFrameShape(QFrame.Shape.HLine)
+
+        translation_label = QLabel("ПЕРЕВОД")
+        translation_label.setObjectName("detailLabel")
+        self.detail_translation = QLabel()
+        self.detail_translation.setObjectName("detailTranslation")
+        self.detail_translation.setFont(mixed_text_font(self.hanzi_font_family, 13))
+        self.detail_translation.setWordWrap(True)
+        self.detail_translation.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        self.examples_label = QLabel("ПРИМЕРЫ")
+        self.examples_label.setObjectName("detailLabel")
+        self.detail_examples = QLabel()
+        self.detail_examples.setObjectName("detailExamples")
+        self.detail_examples.setFont(mixed_text_font(self.hanzi_font_family, 12))
+        self.detail_examples.setWordWrap(True)
+        self.detail_examples.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.stroke_order = StrokeOrderPanel(self.hanzi_font_family)
+
+        article_header = QHBoxLayout()
+        article_header.setSpacing(8)
+        article_header.addWidget(eyebrow)
+        article_header.addStretch()
+        article_header.addWidget(self.copybook_button)
+        article_header.addWidget(self.add_card_button)
+        layout.addLayout(article_header)
+        layout.addSpacing(8)
+        layout.addWidget(self.detail_hanzi)
+        layout.addWidget(self.detail_pinyin)
+        layout.addSpacing(18)
+        layout.addWidget(divider)
+        layout.addSpacing(16)
+        layout.addWidget(translation_label)
+        layout.addWidget(self.detail_translation)
+        layout.addSpacing(18)
+        layout.addWidget(self.examples_label)
+        layout.addWidget(self.detail_examples)
+        layout.addSpacing(18)
+        layout.addWidget(self.stroke_order)
+        layout.addStretch()
+        self.detail_scroll.setWidget(detail)
+        return self.detail_scroll
+
+    def create_copybook_pdf(self) -> None:
+        if not self.current_result:
+            return
+        hanzi = normalize_display_text(
+            self.current_result.get("hanzi", ""),
+            preserve_line_breaks=False,
+        )
+        suggested = Path.home() / "Documents" / suggested_copybook_name(hanzi)
+        if not suggested.parent.exists():
+            suggested = Path.home() / suggested.name
+        output_path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Создать прописи",
+            str(suggested),
+            "PDF (*.pdf)",
+        )
+        if not output_path:
+            return
+        try:
+            result = generate_hanzi_copybook(hanzi, output_path)
+        except (CopybookError, OSError) as exception:
+            QMessageBox.warning(
+                self,
+                "Не удалось создать прописи",
+                str(exception),
+            )
+            return
+
+        message = f"Прописи сохранены:\n{result.path}"
+        if result.missing_characters:
+            message += (
+                "\n\nНет данных о порядке черт для: "
+                + "、".join(result.missing_characters)
+            )
+        QMessageBox.information(self, "Прописи созданы", message)
+
+    def show_edit_menu(self, position) -> None:
+        field = self.search_input
+        menu = QMenu(field)
+
+        undo = menu.addAction("Отменить")
+        undo.setEnabled(field.isUndoAvailable())
+        undo.triggered.connect(field.undo)
+
+        redo = menu.addAction("Повторить")
+        redo.setEnabled(field.isRedoAvailable())
+        redo.triggered.connect(field.redo)
+        menu.addSeparator()
+
+        cut = menu.addAction("Вырезать")
+        cut.setEnabled(field.hasSelectedText() and not field.isReadOnly())
+        cut.triggered.connect(field.cut)
+
+        copy = menu.addAction("Копировать")
+        copy.setEnabled(field.hasSelectedText())
+        copy.triggered.connect(field.copy)
+
+        paste = menu.addAction("Вставить")
+        paste.setEnabled(QApplication.clipboard().mimeData().hasText() and not field.isReadOnly())
+        paste.triggered.connect(field.paste)
+
+        delete = menu.addAction("Удалить")
+        delete.setEnabled(field.hasSelectedText() and not field.isReadOnly())
+        delete.triggered.connect(lambda _checked=False: field.insert(""))
+        menu.addSeparator()
+
+        select_all = menu.addAction("Выделить всё")
+        select_all.setEnabled(bool(field.text()))
+        select_all.triggered.connect(field.selectAll)
+
+        menu.exec(field.mapToGlobal(position))
+
+    def change_hanzi_font(self, _index: int = -1) -> None:
+        family = self.font_selector.currentData()
+        if family not in {KAITI_FAMILY, XINGSHU_FAMILY}:
+            return
+        self.hanzi_font_family = family
+        self.settings.setValue("hanzi_font", family)
+        self.detail_hanzi.setFont(QFont(family, 52, QFont.Weight.Bold))
+        self.detail_translation.setFont(mixed_text_font(family, 13))
+        self.detail_examples.setFont(mixed_text_font(family, 12))
+        self.stroke_order.set_chinese_font(family)
+        self.study_page.set_chinese_font(family)
+        self.empty_mark.setFont(QFont(family, 54, QFont.Weight.Normal))
+
+        for index in range(self.result_list.count()):
+            item = self.result_list.item(index)
+            row = self.result_list.itemWidget(item)
+            hanzi = row.findChild(QLabel, "resultHanzi") if row else None
+            translation = row.findChild(QLabel, "resultTranslation") if row else None
+            if hanzi:
+                character_count = len(CJK_PATTERN.findall(hanzi.text()))
+                size = 16 if character_count <= 4 else 14 if character_count <= 6 else 12
+                hanzi.setFont(QFont(family, size, QFont.Weight.DemiBold))
+            if translation:
+                translation.setFont(mixed_text_font(family, 11))
+
+        current_row = self.result_list.currentRow()
+        if self.current_result and 0 <= current_row < len(self.results):
+            # The examples are already in memory. Reformatting them is enough;
+            # re-reading the multi-gigabyte dictionary made a font change feel
+            # like a second search and briefly hid the article.
+            self.detail_examples.setText(self.format_examples(self.current_examples))
+
+    def on_search_text_changed(self, text: str) -> None:
+        self.update_search_input_font(text)
+        if self.closing:
+            return
+        if not text.strip():
+            self.search_timer.stop()
+            self.show_empty_state()
+            return
+        # Invalidate both pending search and example reads immediately. This
+        # prevents an article for the previous query from appearing during the
+        # debounce delay and being accidentally added to cards.
+        self.search_generation += 1
+        self.examples_generation += 1
+        self.cancel_background_tasks()
+        self.results = []
+        self.current_result = None
+        self.pending_result = None
+        self.current_examples = []
+        self.result_list.clear()
+        self.result_title.setText("Подготовка поиска…")
+        self.result_count.clear()
+        self.detail_stack.setCurrentIndex(0)
+        self.search_timer.start()
+
+    def update_search_input_font(self, text: str) -> None:
+        """Keep normal queries compact while making entered hanzi easy to inspect."""
+        font = QFont()
+        font.setFamilies([INPUT_KAITI_FAMILY, RUSSIAN_FONT_FAMILY])
+        font.setPointSize(22 if CJK_PATTERN.search(text) else 13)
+        self.search_input.setFont(font)
+
+    def show_empty_state(self) -> None:
+        self.search_generation += 1
+        self.examples_generation += 1
+        self.cancel_background_tasks()
+        self.result_list.clear()
+        self.results = []
+        self.current_result = None
+        self.pending_result = None
+        self.current_examples = []
+        self.result_title.setText("Начните поиск")
+        self.result_count.clear()
+        self.detail_stack.setCurrentIndex(0)
+
+    def run_search(self) -> None:
+        self.search_timer.stop()
+        if self.closing:
+            return
+        query = normalize_display_text(
+            self.search_input.text(), preserve_line_breaks=False
+        )
+        if not query:
+            self.show_empty_state()
+            return
+        self.search_generation += 1
+        generation = self.search_generation
+        self.examples_generation += 1
+        self.results = []
+        self.current_result = None
+        self.pending_result = None
+        self.current_examples = []
+        self.result_list.clear()
+        self.result_title.setText(f"Ищу «{query}»…")
+        self.result_count.clear()
+        self.detail_stack.setCurrentIndex(0)
+        self.cancel_background_tasks()
+        task = BackgroundTask(
+            generation, search_entries, query, 50, category="search"
+        )
+        task.signals.finished.connect(
+            lambda task_generation, rows, error, requested=query: self.apply_search_results(
+                task_generation, requested, rows, error
+            )
+        )
+        self.start_background_task(task)
+
+    def start_background_task(self, task: BackgroundTask) -> None:
+        if self.closing:
+            return
+        self.background_tasks.add(task)
+        task.signals.finished.connect(
+            lambda *_arguments, worker=task: self.background_tasks.discard(worker)
+        )
+        self.background_pool.start(task)
+
+    def cancel_background_tasks(self, category: str | None = None) -> None:
+        for task in tuple(self.background_tasks):
+            if category is None or task.category == category:
+                task.cancel()
+
+    def apply_search_results(
+        self, generation: int, query: str, rows: object, error: object
+    ) -> None:
+        if (
+            self.closing
+            or generation != self.search_generation
+            or query
+            != normalize_display_text(
+                self.search_input.text(), preserve_line_breaks=False
+            )
+        ):
+            return
+        if error is not None:
+            self.result_title.setText("Не удалось выполнить поиск")
+            self.result_count.clear()
+            self.detail_stack.setCurrentIndex(0)
+            return
+        self.results = list(rows or [])
+        self.result_title.setText(f"Результаты для «{query}»")
+        self.result_count.setText(f"Найдено: {len(self.results)}")
+
+        for result in self.results:
+            item = QListWidgetItem()
+            row = ResultRow(result, self.hanzi_font_family)
+            item.setSizeHint(QSize(100, 82))
+            self.result_list.addItem(item)
+            self.result_list.setItemWidget(item, row)
+
+        if self.results:
+            self.result_list.setCurrentRow(0)
+        else:
+            self.result_title.setText("Ничего не найдено")
+            self.detail_stack.setCurrentIndex(0)
+
+    def show_result(self, row: int) -> None:
+        if self.closing or row < 0 or row >= len(self.results):
+            return
+        result = self.results[row]
+        self.examples_generation += 1
+        generation = self.examples_generation
+        self.pending_result = result
+        self.current_result = None
+        self.current_examples = []
+        self.detail_stack.setCurrentIndex(0)
+        self.cancel_background_tasks("examples")
+        examples_task = BackgroundTask(
+            generation,
+            get_examples,
+            result["hanzi"],
+            6,
+            result["pinyin"],
+            category="examples",
+        )
+        examples_task.signals.finished.connect(
+            lambda task_generation, examples, error, hanzi=result["hanzi"]: self.apply_examples(
+                task_generation, hanzi, examples, error
+            )
+        )
+        self.start_background_task(examples_task)
+
+    def apply_examples(
+        self, generation: int, hanzi: str, examples: object, error: object
+    ) -> None:
+        if (
+            self.closing
+            or generation != self.examples_generation
+            or not self.pending_result
+            or self.pending_result["hanzi"] != hanzi
+        ):
+            return
+        result = self.pending_result
+        self.pending_result = None
+        self.current_result = result
+        self.current_examples = list(examples or []) if error is None else []
+        display_hanzi = normalize_display_text(
+            result["hanzi"], preserve_line_breaks=False
+        )
+        display_pinyin = normalize_display_text(
+            result["pinyin"], preserve_line_breaks=False
+        )
+        self.detail_hanzi.setText(display_hanzi)
+        self.detail_pinyin.setText(readable_pinyin(display_hanzi, display_pinyin))
+        self.detail_translation.setText(normalize_display_text(result["translation"]))
+        self.detail_examples.setText(self.format_examples(self.current_examples))
+        example_html = self.detail_examples.text()
+        self.examples_label.setVisible(bool(example_html))
+        self.detail_examples.setVisible(bool(example_html))
+        self.stroke_order.set_word(display_hanzi)
+        self.set_card_button_state(self.study_repository.has_card(display_hanzi))
+        self.detail_stack.setCurrentIndex(1)
+        self.detail_scroll.verticalScrollBar().setValue(0)
+
+    def format_examples(self, examples: list[dict]) -> str:
+        example_blocks = []
+        for example in examples:
+            formatted_lines = []
+            chinese = normalize_display_text(example["chinese"])
+            if chinese:
+                formatted_lines.append(
+                    mixed_script_html(
+                        chinese,
+                        self.hanzi_font_family,
+                        14,
+                        RUSSIAN_FONT_FAMILY,
+                        12,
+                    )
+                )
+            for raw_value in (example["pinyin"], example["translation"]):
+                value = normalize_display_text(raw_value)
+                if value:
+                    formatted_lines.append(
+                        f'<span style="font-family:\'{html.escape(RUSSIAN_FONT_FAMILY)}\'; '
+                        f'font-size:12pt;">{html.escape(value).replace(chr(10), "<br>")}</span>'
+                    )
+            if formatted_lines:
+                example_blocks.append("<br>".join(formatted_lines))
+        return "<br>".join(example_blocks)
+
+    def add_current_card(self) -> None:
+        if not self.current_result:
+            return
+        result = self.current_result
+        hanzi = normalize_display_text(result["hanzi"], preserve_line_breaks=False)
+        if self.study_repository.has_card(hanzi):
+            answer = QMessageBox.question(
+                self,
+                "Убрать карточку?",
+                f"Убрать «{hanzi}» из карточек?\n"
+                "Расписание и история повторений этой карточки будут удалены.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            if self.study_repository.remove_card(hanzi):
+                self.set_card_button_state(False)
+                self.update_cards_button(self.study_repository.get_card_count())
+                self.study_page.card_was_removed(hanzi)
+                self.refresh_current_card_button()
+            return
+        added = self.study_repository.add_card(
+            hanzi, result["pinyin"], result["translation"]
+        )
+        if added:
+            self.set_card_button_state(True)
+            self.update_cards_button(self.study_repository.get_card_count())
+            self.study_page.refresh()
+            self.refresh_current_card_button()
+
+    def refresh_current_card_button(self) -> None:
+        if self.current_result:
+            hanzi = normalize_display_text(
+                self.current_result["hanzi"], preserve_line_breaks=False
+            )
+            self.set_card_button_state(
+                self.study_repository.has_card(hanzi)
+            )
+
+    def closeEvent(self, event) -> None:
+        self.closing = True
+        self.search_generation += 1
+        self.examples_generation += 1
+        self.pending_result = None
+        self.current_result = None
+        self.search_timer.stop()
+        self.search_warmup_timer.stop()
+        self.study_page.shutdown()
+        self.cancel_background_tasks()
+        self.background_pool.clear()
+        super().closeEvent(event)
+
+    def set_card_button_state(self, in_cards: bool) -> None:
+        self.add_card_button.setProperty("removeMode", in_cards)
+        self.add_card_button.setText(
+            "− Из карточек" if in_cards else "＋ В карточки"
+        )
+        self.add_card_button.setToolTip(
+            "Удалить слово и его историю повторений"
+            if in_cards
+            else "Добавить слово в учебные карточки"
+        )
+        self.add_card_button.setEnabled(True)
+        self.add_card_button.style().unpolish(self.add_card_button)
+        self.add_card_button.style().polish(self.add_card_button)
+
+
+STYLESHEET = """
+QWidget#root { background: #F4F6F8; color: #182026; }
+QFrame#sidebar { background: #111D22; border: none; }
+QLabel#seal { background: #E05945; color: white; border-radius: 10px; }
+QLabel#brandName { color: #F7FAF9; font-size: 18px; font-weight: 700; }
+QLabel#sidebarSection { color: #71838B; font-size: 10px; font-weight: 700; letter-spacing: 1.4px; padding: 0 10px 7px; }
+QPushButton#navActive, QPushButton#navButton, QPushButton#navDisabled { border: none; border-radius: 9px; padding: 12px 14px; text-align: left; font-size: 14px; }
+QPushButton#navActive { background: #24343A; color: #FFFFFF; font-weight: 600; }
+QPushButton#navActive:hover { background: #2C4047; }
+QPushButton#navButton { background: transparent; color: #B3C0C5; }
+QPushButton#navButton:hover { background: #1A2A30; color: #FFFFFF; }
+QPushButton#navDisabled { background: transparent; color: #71838B; }
+QLabel#localStatus { color: #83949B; background: #17262C; border-radius: 10px; padding: 13px; font-size: 12px; line-height: 1.5; }
+QComboBox#fontSelector { background: #17262C; color: #D8E1E4; border: 1px solid #2A3C43; border-radius: 9px; padding: 9px 11px; font-size: 12px; }
+QComboBox#fontSelector:hover { border-color: #496069; }
+QComboBox#fontSelector::drop-down { border: none; width: 24px; }
+QComboBox#fontSelector QAbstractItemView { background: #17262C; color: #EAF0F2; border: 1px solid #2A3C43; selection-background-color: #E05945; outline: none; }
+QWidget#content { background: #F4F6F8; }
+QLabel#pageTitle { color: #182026; font-size: 28px; font-weight: 700; }
+QLabel#pageSubtitle { color: #6E7C83; font-size: 13px; }
+QFrame#searchShell { background: #FFFFFF; border: 1px solid #DCE2E5; border-radius: 13px; }
+QFrame#searchShell:focus-within { border-color: #E05945; }
+QLineEdit#searchInput { border: none; background: transparent; color: #182026; padding: 0 4px; }
+QLineEdit#searchInput::placeholder { color: #96A2A7; }
+QPushButton#searchButton { background: #E05945; color: white; border: none; border-radius: 9px; padding: 12px 22px; font-size: 13px; font-weight: 700; }
+QPushButton#searchButton:hover { background: #C94D3C; }
+QPushButton#searchButton:pressed { background: #B44334; }
+QPushButton#handwritingButton { background: #F2F6F7; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; min-width: 44px; max-width: 44px; min-height: 40px; max-height: 40px; padding: 0; }
+QPushButton#handwritingButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QPushButton#handwritingButton:pressed { background: #FADFD9; color: #B44334; }
+QDialog#handwritingDialog { background: #F7F9FA; }
+QLabel#handwritingTitle { color: #182026; font-size: 21px; font-weight: 700; }
+QLabel#handwritingSubtitle, QLabel#handwritingStatus { color: #6E7C83; font-size: 12px; }
+QLineEdit#handwritingComposition { background: #FFFFFF; color: #17242A; border: 1px solid #D7DEE1; border-radius: 9px; padding: 8px 12px; min-height: 38px; }
+QWidget#handwritingCanvas { background: #FFFFFF; border: 1px solid #DCE4E7; border-radius: 12px; }
+QPushButton#handwritingCandidate { background: #FFFFFF; color: #17242A; border: 1px solid #D7DEE1; border-radius: 9px; min-width: 50px; min-height: 46px; padding: 2px; }
+QPushButton#handwritingCandidate:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QPushButton#handwritingSecondaryButton, QPushButton#handwritingCancelButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 8px; padding: 9px 13px; }
+QPushButton#handwritingSecondaryButton:hover, QPushButton#handwritingCancelButton:hover { background: #EEF3F5; border-color: #B7C5CA; }
+QPushButton#handwritingInsertButton { background: #E05945; color: #FFFFFF; border: none; border-radius: 9px; padding: 10px 18px; font-weight: 700; }
+QPushButton#handwritingInsertButton:hover { background: #C94D3C; }
+QPushButton#handwritingInsertButton:disabled { background: #D9E0E3; color: #89969C; }
+QLabel#resultTitle { color: #344149; font-size: 13px; font-weight: 600; }
+QLabel#resultCount { color: #7E8A90; font-size: 12px; }
+QSplitter#resultSplitter::handle { background: transparent; width: 12px; }
+QListWidget#resultList, QStackedWidget#detailStack { background: #FFFFFF; border: 1px solid #DFE4E6; border-radius: 12px; outline: none; }
+QListWidget#resultList::item { border-bottom: 1px solid #EDF0F1; }
+QListWidget#resultList::item:selected { background: #FFF1ED; border-left: 3px solid #E05945; }
+QListWidget#resultList::item:hover:!selected { background: #F8FAFA; }
+QLabel#resultHanzi { color: #1B272C; }
+QLabel#resultPinyin { color: #D45240; font-size: 13px; font-weight: 700; }
+QLabel#resultTranslation { color: #647178; font-size: 12px; }
+QFrame#emptyDetail, QFrame#detail { background: #FFFFFF; border: none; border-radius: 12px; }
+QScrollArea#detailScroll { background: #FFFFFF; border: none; }
+QScrollArea#detailScroll > QWidget > QWidget { background: #FFFFFF; }
+QLabel#emptyMark { color: #E7B1A8; font-size: 62px; font-weight: 700; }
+QLabel#emptyTitle { color: #253239; font-size: 17px; font-weight: 700; }
+QLabel#emptyText { color: #7B888E; font-size: 13px; line-height: 1.5; }
+QLabel#detailEyebrow, QLabel#detailLabel { color: #8B989D; font-size: 10px; font-weight: 700; letter-spacing: 1.3px; }
+QLabel#detailHanzi { color: #152126; }
+QLabel#detailPinyin { color: #D45240; font-size: 18px; font-weight: 600; }
+QPushButton#createCopybookButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 9px 13px; font-size: 12px; font-weight: 600; }
+QPushButton#createCopybookButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QPushButton#createCopybookButton:pressed { background: #FADFD9; color: #B44334; }
+QPushButton#addCardButton { background: #F4F7F8; color: #344249; border: 1px solid #D7DEE1; border-radius: 8px; padding: 8px 12px; font-size: 12px; font-weight: 600; }
+QPushButton#addCardButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QPushButton#addCardButton:disabled { background: #EFF6F2; color: #568269; border-color: #D6E7DC; }
+QPushButton#addCardButton[removeMode="true"] { background: #FFF4F2; color: #B94A3A; border-color: #E9C0B9; }
+QPushButton#addCardButton[removeMode="true"]:hover { background: #FCE5E1; color: #9F3528; border-color: #DFA89F; }
+QFrame#divider { color: #E7EBED; }
+QLabel#detailTranslation { color: #354249; font-size: 16px; line-height: 1.6; }
+QLabel#detailExamples { color: #536168; font-size: 14px; line-height: 1.55; }
+QFrame#strokePanel { background: #FFFFFF; border: none; }
+QWidget#strokeCanvas { background: #FFFFFF; border: 1px solid #E2E7E9; border-radius: 10px; }
+QFrame#strokeCharacterSelector { background: #F3F6F7; border: 1px solid #DEE5E7; border-radius: 11px; }
+QPushButton#strokeCharacterChip { background: transparent; color: #405057; border: none; border-radius: 8px; min-width: 42px; min-height: 38px; padding: 0 8px; }
+QPushButton#strokeCharacterChip:hover { background: #FFFFFF; color: #D45240; }
+QPushButton#strokeCharacterChip:checked { background: #FFFFFF; color: #D45240; border: 1px solid #E8D8D4; font-weight: 700; }
+QPushButton#strokeButton, QPushButton#strokePlayButton { border: 1px solid #D7DEE1; border-radius: 8px; padding: 8px 12px; font-size: 12px; }
+QPushButton#strokeButton { background: #FFFFFF; color: #425159; }
+QPushButton#strokePlayButton { background: #E05945; color: #FFFFFF; border-color: #E05945; font-weight: 700; }
+QPushButton#strokeButton:hover { background: #F4F7F8; }
+QPushButton#strokePlayButton:hover { background: #C94D3C; }
+QPushButton#strokeButton:disabled { color: #B7C0C4; background: #F8F9FA; }
+QLabel#strokeStatus { color: #75838A; font-size: 12px; }
+QWidget#studyPage { background: #F4F6F8; }
+QLabel#studySettingLabel, QLabel#studyQueueInfo { color: #6E7C83; font-size: 12px; }
+QPushButton#importCardsButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 10px 14px; font-size: 12px; font-weight: 600; }
+QPushButton#importCardsButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QPushButton#importCardsButton:pressed { background: #FADFD9; color: #B44334; }
+QPushButton#manualCardButton { background: #E05945; color: #FFFFFF; border: none; border-radius: 9px; padding: 11px 15px; font-size: 12px; font-weight: 700; }
+QPushButton#manualCardButton:hover { background: #C94D3C; }
+QPushButton#manualCardButton:pressed { background: #B44334; }
+QDialog#manualCardDialog { background: #F7F9FA; }
+QLabel#manualCardTitle { color: #182026; font-size: 20px; font-weight: 700; }
+QLabel#manualCardSubtitle { color: #6E7C83; font-size: 12px; }
+QLineEdit#manualCardHanzi, QLineEdit#manualCardInput, QPlainTextEdit#manualCardTranslation { background: #FFFFFF; color: #243139; border: 1px solid #D7DEE1; border-radius: 8px; padding: 9px 11px; }
+QLineEdit#manualCardHanzi:focus, QLineEdit#manualCardInput:focus, QPlainTextEdit#manualCardTranslation:focus { border-color: #E05945; }
+QLineEdit#manualCardHanzi[duplicate="true"] { background: #FFF0EE; color: #B42318; border: 2px solid #D92D20; }
+QLabel#manualCardError { color: #B44334; font-size: 12px; }
+QLabel#manualCardStatus { color: #6E7C83; font-size: 12px; }
+QLabel#manualCardStatus[status="duplicate"] { color: #B42318; font-weight: 700; }
+QLabel#manualCardStatus[status="success"] { color: #217A4A; font-weight: 700; }
+QPushButton#manualCardCancelButton { background: #FFFFFF; color: #33444D; border: 1px solid #CFD9DD; border-radius: 9px; padding: 10px 18px; min-width: 90px; }
+QPushButton#manualCardCancelButton:hover { background: #EEF3F5; border-color: #B7C5CA; }
+QPushButton#manualCardSaveButton { background: #E05945; color: #FFFFFF; border: none; border-radius: 9px; padding: 11px 20px; min-width: 145px; font-weight: 700; }
+QPushButton#manualCardSaveButton:hover { background: #C94D3C; }
+QPushButton#manualCardSaveButton:pressed { background: #B44334; }
+QPushButton#manualCardSaveButton:disabled { background: #D9E0E3; color: #89969C; }
+QPushButton#manualCardPriorityButton { background: #FFF4E8; color: #9A4D00; border: 1px solid #F0B978; border-radius: 8px; padding: 9px 15px; font-weight: 700; }
+QPushButton#manualCardPriorityButton:hover { background: #FFE8CC; border-color: #DC9850; }
+QPushButton#manualCardPriorityButton:disabled { background: #E9F5EE; color: #217A4A; border-color: #A8D5BA; }
+QFrame#limitControl { background: #FFFFFF; border: 1px solid #D9E0E3; border-radius: 10px; }
+QSpinBox#dailyLimit { background: transparent; color: #263239; border: none; padding: 6px 3px; min-width: 52px; font-size: 13px; font-weight: 600; }
+QPushButton#limitStepButton { background: transparent; color: #66767D; border: none; border-radius: 7px; min-width: 30px; max-width: 30px; min-height: 30px; max-height: 30px; font-size: 17px; font-weight: 600; padding: 0; }
+QPushButton#limitStepButton:hover { background: #FFF1ED; color: #D45240; }
+QPushButton#limitStepButton:pressed { background: #FADFD9; color: #B44334; }
+QLabel#studyProgress { color: #D45240; font-size: 18px; font-weight: 700; }
+QStackedWidget#studyBody, QFrame#studyEmpty { background: transparent; border: none; }
+QLabel#studyEmptyMark { color: #E7B1A8; }
+QPushButton#continueStudyButton { background: #E05945; color: #FFFFFF; border: none; border-radius: 10px; padding: 12px 22px; min-width: 190px; font-size: 13px; font-weight: 700; }
+QPushButton#continueStudyButton:hover { background: #C94D3C; }
+QPushButton#continueStudyButton:pressed { background: #B44334; }
+QPushButton#continueStudyButton:disabled { background: #D9E0E3; color: #89969C; }
+QFrame#studyCard { background: #FFFFFF; border: 1px solid #DFE4E6; border-radius: 16px; }
+QLabel#studyDirection { color: #8A979D; font-size: 10px; font-weight: 700; letter-spacing: 1.2px; }
+QLabel#cardQuestion { color: #17242A; }
+QPushButton#revealPinyin { background: #EEF2F3; color: #D45240; border: 1px solid #D4DBDE; border-radius: 9px; padding: 10px 18px; font-size: 16px; font-weight: 600; }
+QPushButton#showAnswerButton { background: #E05945; color: #FFFFFF; border: none; border-radius: 10px; padding: 12px 28px; font-size: 13px; font-weight: 700; }
+QPushButton#showAnswerButton:hover { background: #C94D3C; }
+QLabel#cardAnswerPrimary { color: #253239; }
+QScrollArea#cardAnswerScroll { background: transparent; border: none; }
+QScrollArea#cardAnswerScroll QWidget#qt_scrollarea_viewport, QScrollArea#cardAnswerScroll QLabel { background: transparent; }
+QLabel#cardAnswerPinyin { color: #D45240; font-size: 16px; font-weight: 600; }
+QPushButton#showExamplesButton { background: #F4F7F8; color: #425159; border: 1px solid #D7DEE1; border-radius: 8px; padding: 8px 14px; }
+QPushButton#showExamplesButton:hover { background: #EAF0F2; }
+QScrollArea#cardExamplesScroll { background: #F8FAFA; border: 1px solid #E5EAEC; border-radius: 9px; }
+QScrollArea#cardExamplesScroll QWidget#qt_scrollarea_viewport, QWidget#cardExamplesContainer { background: #F8FAFA; }
+QLabel#cardExamples { color: #536168; font-size: 14px; }
+QPushButton#ratingVeryHard, QPushButton#ratingHard, QPushButton#ratingMedium, QPushButton#ratingEasy { border-radius: 9px; padding: 9px 6px; font-size: 11px; font-weight: 700; min-height: 42px; }
+QPushButton#ratingVeryHard { background: #FCEAE7; color: #B53F32; border: 1px solid #F0B9B1; }
+QPushButton#ratingHard { background: #FFF3E1; color: #A86419; border: 1px solid #EBCB9C; }
+QPushButton#ratingMedium { background: #EDF5F7; color: #346B78; border: 1px solid #BDD6DC; }
+QPushButton#ratingEasy { background: #EAF5EE; color: #35704C; border: 1px solid #BEDCC9; }
+QScrollBar:vertical { background: transparent; width: 8px; margin: 5px 2px; }
+QScrollBar::handle:vertical { background: #CDD5D8; border-radius: 4px; min-height: 28px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+"""
+
+
+def main() -> None:
+    if not DB_PATH.exists():
+        raise SystemExit("В комплекте приложения не найдена база HanziLab")
+    app = QApplication(sys.argv)
+    app.setApplicationName("HanziLab")
+    app.setOrganizationName("HanziLab")
+    app.setWindowIcon(QIcon(str(APP_ICON_PNG)))
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "HanziLab.Desktop"
+            )
+        except (AttributeError, OSError):
+            pass
+    app.setStyle("Fusion")
+    load_chinese_fonts()
+    app.setFont(QFont(RUSSIAN_FONT_FAMILY, 10))
+    app.setStyleSheet(STYLESHEET)
+    window = HanziLabWindow()
+    window.show()
+    window.schedule_search_warmup()
+    raise SystemExit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

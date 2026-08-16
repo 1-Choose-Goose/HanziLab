@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+release/
+output/
+tmp/
+.idea/
+data/hanzi.db
+data/dictionary.db
+data/study.db
+data/*.db-shm
+data/*.db-wal
