@@ -318,16 +318,18 @@ class HandwritingDialog(QDialog):
 
     def schedule_recognition(self) -> None:
         self.generation += 1
-        self.pool.clear()
+        self.cancel_pending_tasks()
+        self.show_candidates([])
         if not self.canvas.strokes:
             self.recognition_timer.stop()
             self.status.setText("Нарисуйте первую черту")
-            self.show_candidates([])
             return
         self.status.setText("Распознаю…")
         self.recognition_timer.start()
 
     def start_recognition(self) -> None:
+        if not self.canvas.strokes:
+            return
         task = RecognitionTask(self.generation, self.canvas.recognition_strokes())
         self.tasks.add(task)
         task.signals.finished.connect(self.finish_recognition)
@@ -375,8 +377,15 @@ class HandwritingDialog(QDialog):
         self.composition.setText(self.composition.text()[:-1])
         self.insert_button.setEnabled(bool(self.composition.text()))
 
-    def closeEvent(self, event) -> None:
+    def cancel_pending_tasks(self) -> None:
+        # Removed runnables never emit finished, so release our references here.
+        # Auto-delete is disabled to make tryTake safe even as a task finishes.
+        for task in tuple(self.tasks):
+            if self.pool.tryTake(task):
+                self.tasks.discard(task)
+
+    def done(self, result: int) -> None:
         self.generation += 1
         self.recognition_timer.stop()
-        self.pool.clear()
-        super().closeEvent(event)
+        self.cancel_pending_tasks()
+        super().done(result)

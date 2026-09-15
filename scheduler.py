@@ -96,7 +96,9 @@ class ScheduleOutcome:
 def ensure_aware(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
-    return value
+    # Arithmetic between values with the same local tzinfo follows wall time.
+    # Use UTC so a learning interval remains exact across DST transitions.
+    return value.astimezone(timezone.utc)
 
 
 def parse_datetime(value: str | datetime | None) -> datetime | None:

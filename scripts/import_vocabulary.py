@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import csv
 import sqlite3
 import sys
+import unicodedata
 from collections import OrderedDict
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
-    from scripts.text_normalization import normalize_pinyin, normalize_translation
+    from scripts.dictionary_schema import build_indexes, create_dictionary_schema
+    from scripts.text_normalization import normalize_translation
 except ModuleNotFoundError:
-    from text_normalization import normalize_pinyin, normalize_translation
+    from dictionary_schema import build_indexes, create_dictionary_schema
+    from text_normalization import normalize_translation
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -82,12 +86,9 @@ def append_unique(items: list[str], value: str) -> None:
     if not value:
         return
     normalized = normalize_translation(value)
-    for index, item in enumerate(items):
+    for item in items:
         current = normalize_translation(item)
-        if normalized == current or normalized in current:
-            return
-        if current in normalized:
-            items[index] = value
+        if normalized == current:
             return
     items.append(value)
 
@@ -96,14 +97,20 @@ def load_rows(source: Path) -> tuple[list[Entry], list[tuple]]:
     grouped: OrderedDict[str, Entry] = OrderedDict()
     corrections_log: list[tuple] = []
     with source.open("r", encoding="utf-8-sig", newline="") as handle:
-        for source_line, raw in enumerate(handle, 1):
-            if raw.startswith("#") or not raw.strip():
+        reader = csv.reader(handle, delimiter="\t")
+        for columns in reader:
+            source_line = reader.line_num
+            if not columns or not any(item.strip() for item in columns) or columns[0].startswith("#"):
                 continue
-            columns = raw.rstrip("\r\n").split("\t")
             if len(columns) < 3:
-                corrections_log.append((source_line, "row", raw.strip(), "", "Пропущена неполная строка"))
+                corrections_log.append((source_line, "row", "\t".join(columns), "", "Пропущена неполная строка"))
                 continue
-            original_hanzi, original_pinyin, original_translation = (item.strip() for item in columns[:3])
+            original_hanzi, original_pinyin, original_translation = (
+                item.replace("\r\n", "\n").replace("\r", "\n").strip() for item in columns[:3]
+            )
+            if not original_hanzi:
+                corrections_log.append((source_line, "row", "\t".join(columns), "", "Пропущен пустой заголовок"))
+                continue
             hanzi = HANZI_REPLACEMENTS.get(original_hanzi, original_hanzi)
             if hanzi != original_hanzi:
                 corrections_log.append((source_line, "hanzi", original_hanzi, hanzi, "Исправлена опечатка"))
@@ -118,7 +125,10 @@ def load_rows(source: Path) -> tuple[list[Entry], list[tuple]]:
 
             entry = grouped.setdefault(hanzi, Entry(hanzi=hanzi))
             for variant in pinyin.replace(",", ";").split(";"):
-                if variant.strip() and normalize_pinyin(variant) not in {normalize_pinyin(item) for item in entry.pinyins}:
+                # Тон — часть чтения: zhōng и zhòng должны остаться вариантами.
+                if variant.strip() and unicodedata.normalize("NFC", variant.strip()).casefold() not in {
+                    unicodedata.normalize("NFC", item).casefold() for item in entry.pinyins
+                }:
                     entry.pinyins.append(variant.strip())
             append_unique(entry.translations, translation)
             entry.source_rows += 1
@@ -133,46 +143,15 @@ def build_database(source: Path, database: Path = DEFAULT_DB) -> dict[str, int]:
     if temporary.exists():
         temporary.unlink()
     with closing(sqlite3.connect(temporary)) as connection, connection:
-        connection.executescript(
-            """
-            PRAGMA journal_mode=DELETE;
-            CREATE TABLE entries (
-                hanzi TEXT NOT NULL UNIQUE,
-                pinyin TEXT NOT NULL,
-                translation TEXT NOT NULL
-            );
-            CREATE TABLE examples (
-                chinese TEXT NOT NULL,
-                pinyin TEXT NOT NULL,
-                translation TEXT NOT NULL DEFAULT '',
-                UNIQUE(chinese, translation)
-            );
-            CREATE VIRTUAL TABLE entries_fts USING fts5(
-                hanzi, pinyin, translation,
-                content='', tokenize='trigram'
-            );
-            CREATE VIRTUAL TABLE examples_fts USING fts5(
-                chinese, pinyin, translation,
-                content='', tokenize='trigram'
-            );
-            """
-        )
+        create_dictionary_schema(connection)
         for entry in entries:
             pinyin = "; ".join(entry.pinyins)
             translation = "; ".join(entry.translations)
-            cursor = connection.execute(
+            connection.execute(
                 "INSERT INTO entries(hanzi, pinyin, translation) VALUES (?, ?, ?)",
                 (entry.hanzi, pinyin, translation),
             )
-            connection.execute(
-                "INSERT INTO entries_fts(rowid, hanzi, pinyin, translation) VALUES (?, ?, ?, ?)",
-                (
-                    cursor.lastrowid,
-                    entry.hanzi,
-                    " ".join(normalize_pinyin(item) for item in entry.pinyins),
-                    normalize_translation(translation),
-                ),
-            )
+        build_indexes(connection)
         connection.execute("ANALYZE")
     temporary.replace(database)
     return {"source_rows": sum(entry.source_rows for entry in entries), "entries": len(entries), "corrections": len(corrections)}

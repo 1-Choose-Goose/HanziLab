@@ -10,15 +10,28 @@ from pathlib import Path
 from pypinyin import Style, lazy_pinyin
 
 try:
-    from scripts.text_normalization import normalize_pinyin, normalize_translation
+    from scripts.dictionary_schema import build_indexes
+    from scripts.dictionary_schema import (
+        create_dictionary_schema as create_clean_schema,
+    )
+    from scripts.text_normalization import (
+        CJK_RE,
+        normalize_translation,
+        normalized_pinyin_variants,
+    )
 except ModuleNotFoundError:
-    from text_normalization import normalize_pinyin, normalize_translation
+    from dictionary_schema import build_indexes
+    from dictionary_schema import create_dictionary_schema as create_clean_schema
+    from text_normalization import (
+        CJK_RE,
+        normalize_translation,
+        normalized_pinyin_variants,
+    )
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DATABASE = ROOT / "data" / "hanzi.db"
 EXAMPLES_SOURCE = Path("D:/\u0420\u0430\u0431\u043e\u0447\u0438\u0439 \u0441\u0442\u043e\u043b/examples_260809")
-CJK_RE = re.compile(r"[\u3400-\u9fff]")
 CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 
 
@@ -58,7 +71,10 @@ def split_article(text: str) -> tuple[str, list[tuple[str, str]]]:
     translation: list[str] = [lines[0]]
     examples: list[tuple[str, str]] = []
     for line in lines[1:]:
-        if CJK_RE.search(line):
+        # Русские пояснения могут упоминать иероглифы (например, «см. 学»).
+        # Переносим только строки, действительно начинающиеся примером.
+        first = line.lstrip(" \t\"'«“([{（【")
+        if CJK_RE.match(first):
             examples.append(split_example_line(line))
         else:
             translation.append(line)
@@ -99,36 +115,6 @@ def iter_external_examples(path: Path):
         yield item
 
 
-def create_clean_schema(connection: sqlite3.Connection) -> None:
-    connection.executescript(
-        """
-        PRAGMA journal_mode=OFF;
-        PRAGMA synchronous=OFF;
-        PRAGMA temp_store=MEMORY;
-        PRAGMA cache_size=-262144;
-        CREATE TABLE entries (
-            hanzi TEXT NOT NULL UNIQUE,
-            pinyin TEXT NOT NULL,
-            translation TEXT NOT NULL
-        );
-        CREATE TABLE examples (
-            chinese TEXT NOT NULL,
-            pinyin TEXT NOT NULL,
-            translation TEXT NOT NULL DEFAULT '',
-            UNIQUE(chinese, translation)
-        );
-        CREATE VIRTUAL TABLE entries_fts USING fts5(
-            hanzi, pinyin, translation,
-            content='', tokenize='trigram'
-        );
-        CREATE VIRTUAL TABLE examples_fts USING fts5(
-            chinese, pinyin, translation,
-            content='', tokenize='trigram'
-        );
-        """
-    )
-
-
 def flush_entries(connection: sqlite3.Connection, entries: list[tuple], fts: list[tuple]) -> None:
     connection.executemany(
         "INSERT INTO entries(rowid, hanzi, pinyin, translation) VALUES (?, ?, ?, ?)", entries
@@ -148,13 +134,17 @@ def flush_examples(connection: sqlite3.Connection, examples: list[tuple]) -> Non
 
 
 def compact_database(database: Path = DATABASE, examples_source: Path = EXAMPLES_SOURCE) -> dict[str, int | float]:
+    if not database.is_file():
+        raise FileNotFoundError(database)
     temporary = database.with_name(database.stem + ".compacting" + database.suffix)
     if temporary.exists():
         temporary.unlink()
     started = time.monotonic()
-    scanned = articles = preserved_examples = embedded_examples = external_examples = 0
+    articles = preserved_examples = embedded_examples = external_examples = 0
 
-    with closing(sqlite3.connect(database)) as source, closing(sqlite3.connect(temporary)) as target:
+    with closing(sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)) as source, closing(sqlite3.connect(temporary)) as target:
+        target.execute("PRAGMA temp_store=MEMORY")
+        target.execute("PRAGMA cache_size=-262144")
         create_clean_schema(target)
         entry_batch: list[tuple] = []
         entry_fts_batch: list[tuple] = []
@@ -177,16 +167,15 @@ def compact_database(database: Path = DATABASE, examples_source: Path = EXAMPLES
                     flush_examples(target, example_batch)
             examples_cursor.close()
 
-        source_cursor = source.execute("SELECT hanzi, pinyin, translation FROM entries ORDER BY rowid")
-        for hanzi, pinyin, raw_translation in source_cursor:
-            scanned += 1
+        source_cursor = source.execute("SELECT rowid, hanzi, pinyin, translation FROM entries ORDER BY rowid")
+        for rowid, hanzi, pinyin, raw_translation in source_cursor:
             translation, extracted = split_article(raw_translation)
             articles += 1
-            entry_batch.append((articles, hanzi, pinyin, translation))
+            entry_batch.append((rowid, hanzi, pinyin, translation))
             entry_fts_batch.append((
-                articles,
+                rowid,
                 hanzi,
-                normalize_pinyin(pinyin),
+                normalized_pinyin_variants(pinyin),
                 normalize_translation(translation),
             ))
             for chinese, example_translation in extracted:
@@ -197,8 +186,8 @@ def compact_database(database: Path = DATABASE, examples_source: Path = EXAMPLES
                 flush_entries(target, entry_batch, entry_fts_batch)
             if len(example_batch) >= 5000:
                 flush_examples(target, example_batch)
-            if scanned % 250000 == 0:
-                print(f"Перенесено {scanned:,} словарных статей…".replace(",", " "), flush=True)
+            if articles % 250000 == 0:
+                print(f"Перенесено {articles:,} словарных статей…".replace(",", " "), flush=True)
 
         if entry_batch:
             flush_entries(target, entry_batch, entry_fts_batch)
@@ -224,29 +213,7 @@ def compact_database(database: Path = DATABASE, examples_source: Path = EXAMPLES
         unique_examples = target.execute("SELECT count(*) FROM examples").fetchone()[0]
         print(f"Создаю индекс для {unique_examples:,} уникальных примеров…".replace(",", " "), flush=True)
         target.execute("BEGIN")
-        fts_batch: list[tuple] = []
-        examples_cursor = target.execute(
-            "SELECT rowid, chinese, pinyin, translation FROM examples ORDER BY rowid"
-        )
-        for rowid, chinese, pinyin, translation in examples_cursor:
-            fts_batch.append((
-                rowid,
-                chinese,
-                normalize_pinyin(pinyin),
-                normalize_translation(translation),
-            ))
-            if len(fts_batch) >= 5000:
-                target.executemany(
-                    "INSERT INTO examples_fts(rowid, chinese, pinyin, translation) VALUES (?, ?, ?, ?)",
-                    fts_batch,
-                )
-                fts_batch.clear()
-        if fts_batch:
-            target.executemany(
-                "INSERT INTO examples_fts(rowid, chinese, pinyin, translation) VALUES (?, ?, ?, ?)",
-                fts_batch,
-            )
-        examples_cursor.close()
+        build_indexes(target, tables=("examples",))
         target.commit()
         target.execute("ANALYZE")
         target.commit()

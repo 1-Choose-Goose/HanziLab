@@ -6,12 +6,19 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from scheduler import CardState, Rating, ReviewDirection, ScheduleOutcome
+from scheduler import (
+    CardState,
+    Rating,
+    ReviewDirection,
+    ScheduleOutcome,
+    ensure_aware,
+    parse_datetime,
+)
 from text_formatting import normalize_display_text
 
 ROOT = Path(__file__).resolve().parent
 STUDY_DB_PATH = ROOT / "data" / "study.db"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 DEFAULT_DAILY_REVIEW_LIMIT = 30
 DAILY_SESSION_LIMIT_PREFIX = "daily_session_limit:"
 DAILY_BATCH_START_PREFIX = "daily_batch_start:"
@@ -39,15 +46,11 @@ def utc_now() -> datetime:
 def to_storage(value: datetime | None) -> str | None:
     if value is None:
         return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat()
+    return ensure_aware(value).isoformat()
 
 
 def local_date(value: datetime) -> str:
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone().date().isoformat()
+    return ensure_aware(value).astimezone().date().isoformat()
 
 
 def initialize_study_database(database: Path = STUDY_DB_PATH) -> None:
@@ -61,6 +64,9 @@ def initialize_study_database(database: Path = STUDY_DB_PATH) -> None:
             )
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
+        # DDL is otherwise committed immediately, and executescript also
+        # commits any open transaction before running its first statement.
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS cards (
@@ -79,8 +85,7 @@ def initialize_study_database(database: Path = STUDY_DB_PATH) -> None:
             if name not in existing:
                 connection.execute(f"ALTER TABLE cards ADD COLUMN {name} {definition}")
 
-        connection.executescript(
-            """
+        schema = """
             CREATE TABLE IF NOT EXISTS review_events (
                 id INTEGER PRIMARY KEY,
                 card_id INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
@@ -144,7 +149,9 @@ def initialize_study_database(database: Path = STUDY_DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_learning_queue_available
                 ON learning_queue(completed_at, available_at);
             """
-        )
+        for statement in schema.split(";"):
+            if statement.strip():
+                connection.execute(statement)
         # Старые версии не запрещали несколько незавершённых показов/повторов
         # одной логической карточки. Оставляем самую свежую запись и закрепляем
         # инвариант частичными UNIQUE-индексами.
@@ -204,9 +211,6 @@ def initialize_study_database(database: Path = STUDY_DB_PATH) -> None:
                 WHERE q.completed_at IS NULL
                 """
             )
-        if current_version < SCHEMA_VERSION:
-            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-
         # Безопасная миграция: зрелость старой карточки восстанавливается из
         # доступного интервала/счётчика, а не сбрасывается в NEW.
         connection.execute(
@@ -221,6 +225,23 @@ def initialize_study_database(database: Path = STUDY_DB_PATH) -> None:
                     ELSE learning_state END
             """
         )
+        if current_version < 7:
+            # SQL compares due dates as text. Legacy ISO timestamps may use a
+            # local UTC offset or a space separator, which changes that order.
+            for table, columns in (
+                ("cards", ("last_review_at", "next_review_at")),
+                ("learning_queue", ("available_at",)),
+            ):
+                for column in columns:
+                    rows = connection.execute(
+                        f"SELECT id, {column} FROM {table} WHERE {column} IS NOT NULL"
+                    ).fetchall()
+                    connection.executemany(
+                        f"UPDATE {table} SET {column}=? WHERE id=?",
+                        [(to_storage(parse_datetime(value)), row_id) for row_id, value in rows],
+                    )
+        if current_version < SCHEMA_VERSION:
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
 class StudyRepository:
@@ -271,13 +292,15 @@ class StudyRepository:
             return connection.total_changes - before
 
     def has_card(self, hanzi: str) -> bool:
+        hanzi = normalize_display_text(hanzi, preserve_line_breaks=False)
         with closing(self.connect()) as connection:
             return connection.execute(
-                "SELECT 1 FROM cards WHERE hanzi = ?", (hanzi.strip(),)
+                "SELECT 1 FROM cards WHERE hanzi = ?", (hanzi,)
             ).fetchone() is not None
 
     def can_raise_card_priority(self, hanzi: str) -> bool:
         """Проверяет, нужна ли существующей карточке ручная приоритизация."""
+        hanzi = normalize_display_text(hanzi, preserve_line_breaks=False)
         with closing(self.connect()) as connection:
             row = connection.execute(
                 """
@@ -296,7 +319,7 @@ class StudyRepository:
                        ) AS has_direction_rating
                 FROM cards c WHERE c.hanzi=?
                 """,
-                (hanzi.strip(),),
+                (hanzi,),
             ).fetchone()
         if row is None:
             return False
@@ -310,6 +333,7 @@ class StudyRepository:
 
     def raise_card_priority(self, hanzi: str) -> bool:
         """Поднимает обычную карточку до ближайшего полного прохождения."""
+        hanzi = normalize_display_text(hanzi, preserve_line_breaks=False)
         with closing(self.connect()) as connection, connection:
             cursor = connection.execute(
                 """
@@ -329,15 +353,16 @@ class StudyRepository:
                       WHERE r.card_id=cards.id
                   )
                 """,
-                (hanzi.strip(),),
+                (hanzi,),
             )
             return cursor.rowcount == 1
 
     def remove_card(self, hanzi: str) -> bool:
         """Удаляет логическую карточку и связанные данные через FK CASCADE."""
+        hanzi = normalize_display_text(hanzi, preserve_line_breaks=False)
         with closing(self.connect()) as connection, connection:
             cursor = connection.execute(
-                "DELETE FROM cards WHERE hanzi = ?", (hanzi.strip(),)
+                "DELETE FROM cards WHERE hanzi = ?", (hanzi,)
             )
             return cursor.rowcount == 1
 
@@ -473,7 +498,13 @@ class StudyRepository:
                        EXISTS(
                            SELECT 1 FROM presentations p
                            WHERE p.card_id=d.card_id AND p.completed_at IS NULL
-                       ) AS has_active_presentation
+                       ) OR EXISTS(
+                           SELECT 1 FROM learning_queue q
+                           WHERE q.card_id=d.card_id AND q.completed_at IS NULL
+                       ) OR EXISTS(
+                           SELECT 1 FROM direction_ratings r
+                           WHERE r.card_id=d.card_id
+                       ) AS has_unfinished_pair
                 FROM daily_cards d
                 WHERE d.local_date=?
                 ORDER BY d.position
@@ -509,6 +540,28 @@ class StudyRepository:
             rows = connection.execute(
                 "SELECT * FROM daily_cards WHERE local_date=? ORDER BY position",
                 (date_key,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_unfinished_cards(self) -> list[dict]:
+        """Pairs already started must keep a daily slot after midnight too."""
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT c.id AS card_id,
+                       coalesce(p.direction, q.direction,
+                           CASE WHEN r.chinese_to_russian_rating IS NOT NULL
+                                THEN 'RUSSIAN_TO_CHINESE'
+                                ELSE 'CHINESE_TO_RUSSIAN' END) AS direction
+                FROM cards c
+                LEFT JOIN presentations p
+                    ON p.card_id=c.id AND p.completed_at IS NULL
+                LEFT JOIN learning_queue q
+                    ON q.card_id=c.id AND q.completed_at IS NULL
+                LEFT JOIN direction_ratings r ON r.card_id=c.id
+                WHERE p.id IS NOT NULL OR q.id IS NOT NULL OR r.card_id IS NOT NULL
+                ORDER BY coalesce(p.shown_at, q.created_at, r.started_at), c.id
+                """
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -559,9 +612,12 @@ class StudyRepository:
             rows = connection.execute(
                 """
                 SELECT c.*, d.direction AS daily_direction, d.position,
-                       d.completed AS daily_completed
+                       d.completed AS daily_completed,
+                       p.id AS active_presentation_id
                 FROM daily_cards d
                 JOIN cards c ON c.id=d.card_id
+                LEFT JOIN presentations p
+                    ON p.card_id=c.id AND p.completed_at IS NULL
                 WHERE d.local_date=?
                   AND NOT EXISTS (
                       SELECT 1 FROM learning_queue q
@@ -605,9 +661,12 @@ class StudyRepository:
             rows = connection.execute(
                 """
                 SELECT c.*, q.id AS learning_queue_id,
-                       q.direction AS queued_direction
+                       q.direction AS queued_direction,
+                       p.id AS active_presentation_id
                 FROM learning_queue q
                 JOIN cards c ON c.id=q.card_id
+                LEFT JOIN presentations p
+                    ON p.card_id=c.id AND p.completed_at IS NULL
                 WHERE q.completed_at IS NULL AND q.available_at <= ?
                 ORDER BY q.id
                 """,
@@ -832,29 +891,3 @@ class StudyRepository:
     def review_event_count(self) -> int:
         with closing(self.connect()) as connection:
             return connection.execute("SELECT count(*) FROM review_events").fetchone()[0]
-
-
-_default_repository: StudyRepository | None = None
-
-
-def default_repository() -> StudyRepository:
-    global _default_repository
-    if _default_repository is None:
-        _default_repository = StudyRepository()
-    return _default_repository
-
-
-def add_card(hanzi: str, pinyin: str, translation: str) -> bool:
-    return default_repository().add_card(hanzi, pinyin, translation)
-
-
-def has_card(hanzi: str) -> bool:
-    return default_repository().has_card(hanzi)
-
-
-def get_cards() -> list[CardState]:
-    return default_repository().get_cards()
-
-
-def get_card_count() -> int:
-    return default_repository().get_card_count()

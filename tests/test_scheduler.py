@@ -2,6 +2,7 @@ import math
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scheduler import (
     CardState,
@@ -169,6 +170,26 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(first.card.next_review_at, datetime(2027, 1, 1, 0, 1, tzinfo=timezone.utc))
         learning = schedule_rating(first.card, Rating.HARD, first.card.next_review_at)
         self.assertEqual(learning.card.next_review_at.minute, 11)
+
+    def test_intervals_and_elapsed_time_use_real_time_across_dst(self):
+        try:
+            eastern = ZoneInfo("America/New_York")
+        except ZoneInfoNotFoundError:
+            self.skipTest("IANA time-zone database is unavailable")
+        before_change = datetime(2026, 3, 8, 1, 59, tzinfo=eastern)
+        outcome = schedule_rating(new_card(), Rating.VERY_HARD, before_change)
+        self.assertEqual(
+            outcome.card.next_review_at.astimezone(timezone.utc),
+            before_change.astimezone(timezone.utc) + timedelta(minutes=2),
+        )
+        self.assertEqual(outcome.card.next_review_at.astimezone(eastern).hour, 3)
+
+        remembered = replace(new_card(), stability=1, last_review_at=before_change)
+        after_change = datetime(2026, 3, 8, 3, 1, tzinfo=eastern)
+        self.assertAlmostEqual(
+            calculate_retrievability(remembered, after_change),
+            0.9 ** (2 / (24 * 60)),
+        )
 
     def test_maximum_interval_and_math_safety(self):
         config = SchedulerConfig(maximum_interval_days=3650)

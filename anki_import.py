@@ -7,11 +7,9 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 
+from scripts.text_normalization import CJK_RE
+
 SOUND_RE = re.compile(r"\[sound:[^\]]*]", flags=re.IGNORECASE)
-CJK_RE = re.compile(
-    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
-    r"\U00020000-\U0002fa1f]"
-)
 SEPARATORS = {
     "tab": "\t",
     "comma": ",",
@@ -26,17 +24,23 @@ class _PlainTextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
+        self.hidden_tag: str | None = None
 
     def handle_starttag(self, tag: str, _attributes) -> None:
-        if tag.lower() in BLOCK_TAGS:
+        if tag in {"script", "style"}:
+            self.hidden_tag = tag
+        elif tag in BLOCK_TAGS and self.hidden_tag is None:
             self.parts.append(" ")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.lower() in BLOCK_TAGS:
+        if tag == self.hidden_tag:
+            self.hidden_tag = None
+        elif tag in BLOCK_TAGS and self.hidden_tag is None:
             self.parts.append(" ")
 
     def handle_data(self, data: str) -> None:
-        self.parts.append(data)
+        if self.hidden_tag is None:
+            self.parts.append(data)
 
 
 @dataclass(frozen=True)
@@ -61,29 +65,39 @@ def clean_anki_field(value: str) -> str:
     return " ".join("".join(extractor.parts).replace("\xa0", " ").split())
 
 
-def _delimiter_and_data(content: str) -> tuple[str, str]:
+def _delimiter_and_data(content: str) -> tuple[str, str, set[int]]:
     delimiter = "\t"
+    metadata_columns: set[int] = set()
     data_lines: list[str] = []
     reading_directives = True
     for line in content.splitlines(keepends=True):
         stripped = line.strip().lstrip("\ufeff")
+        if reading_directives and not stripped:
+            continue
         if reading_directives and stripped.startswith("#"):
             key, separator, value = stripped.partition(":")
             if separator and key.lower() == "#separator":
                 requested = value.strip().lower()
-                delimiter = SEPARATORS.get(requested, value[:1])
-                if not delimiter:
-                    raise ValueError("В экспорте Anki не указан разделитель полей")
+                delimiter = SEPARATORS.get(requested, value.strip())
+                if len(delimiter) != 1 or delimiter in {"\r", "\n", "\x00"}:
+                    raise ValueError("В экспорте Anki указан неверный разделитель полей")
+            elif separator and key.lower() in {
+                "#notetype column", "#deck column", "#tags column", "#guid column"
+            }:
+                column = int(value.strip())
+                if column < 1:
+                    raise ValueError("Номер служебного столбца Anki должен быть положительным")
+                metadata_columns.add(column - 1)
             continue
         reading_directives = False
         data_lines.append(line)
-    return delimiter, "".join(data_lines)
+    return delimiter, "".join(data_lines), metadata_columns
 
 
 def parse_anki_export(path: str | Path) -> AnkiImportResult:
     content = Path(path).read_text(encoding="utf-8-sig")
-    delimiter, data = _delimiter_and_data(content)
-    reader = csv.reader(io.StringIO(data, newline=""), delimiter=delimiter)
+    delimiter, data, metadata_columns = _delimiter_and_data(content)
+    reader = csv.reader(io.StringIO(data, newline=""), delimiter=delimiter, strict=True)
 
     cards: list[ImportedCard] = []
     seen_hanzi: set[str] = set()
@@ -93,13 +107,14 @@ def parse_anki_export(path: str | Path) -> AnkiImportResult:
         if not fields or not any(field.strip() for field in fields):
             continue
         source_rows += 1
-        if len(fields) < 3:
+        fields = [value for index, value in enumerate(fields) if index not in metadata_columns]
+        if not fields:
             invalid_rows += 1
             continue
 
         hanzi = clean_anki_field(fields[0])
-        pinyin = clean_anki_field(fields[1])
-        translation = clean_anki_field(fields[2])
+        pinyin = clean_anki_field(fields[1]) if len(fields) > 1 else ""
+        translation = clean_anki_field(fields[2]) if len(fields) > 2 else ""
         # Only the Chinese headword is used for lookup. Anki's pinyin,
         # translation, tags and media never overwrite HanziLab dictionary data.
         if not hanzi or not CJK_RE.search(hanzi):

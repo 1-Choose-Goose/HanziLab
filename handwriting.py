@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import heapq
-import json
 import math
 from collections.abc import Iterable, Sequence
 from functools import lru_cache
 from itertools import pairwise
 
-from stroke_order import STROKE_DATA_DIR
+import stroke_order
 
 Point = tuple[float, float]
 Stroke = Sequence[Point]
@@ -15,9 +14,11 @@ SAMPLES_PER_STROKE = 10
 
 
 def _resample(stroke: Stroke, count: int = SAMPLES_PER_STROKE) -> list[Point]:
+    if count <= 0:
+        return []
     if not stroke:
         return [(0.0, 0.0)] * count
-    if len(stroke) == 1:
+    if len(stroke) == 1 or count == 1:
         return [stroke[0]] * count
     lengths = [0.0]
     for first, second in pairwise(stroke):
@@ -108,13 +109,12 @@ def _distance(first: tuple[bytes, ...], second: tuple[bytes, ...]) -> float:
 def handwriting_index() -> dict[int, tuple[tuple[str, tuple[bytes, ...]], ...]]:
     """Build a compact offline index from the bundled stroke medians."""
     grouped: dict[int, list[tuple[str, tuple[bytes, ...]]]] = {}
-    for path in STROKE_DATA_DIR.glob("*.json"):
+    for path in stroke_order.STROKE_DATA_DIR.glob("*.json"):
         character = path.stem
         if len(character) != 1:
             continue
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        data = stroke_order.load_character_data(character)
+        if data is None:
             continue
         medians = data.get("medians")
         if not medians or len(medians) > 40:

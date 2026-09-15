@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import ctypes
-import html
 import re
 import sys
 import unicodedata
-from functools import cache, lru_cache
+from functools import cache
 from pathlib import Path
 
 from pypinyin import Style, lazy_pinyin
-from pypinyin.constants import PINYIN_DICT
 from PySide6.QtCore import (
     QEvent,
     QObject,
@@ -47,15 +45,23 @@ from PySide6.QtWidgets import (
 
 from copybook_pdf import (
     CopybookError,
+    CopybookStyle,
     generate_hanzi_copybook,
     suggested_copybook_name,
 )
 from database import DB_PATH, get_examples, get_stats, search_entries, warm_search_index
 from handwriting_view import HandwritingDialog
+from cursive_view import CursivePage
+from scripts.text_normalization import CJK_RE
+from scripts.text_normalization import normalize_pinyin as _pinyin_base
 from stroke_order import StrokeOrderPanel
 from study_database import StudyRepository
 from study_view import StudyPage
-from text_formatting import mixed_script_html, normalize_display_text
+from text_formatting import (
+    format_example_blocks,
+    normalize_display_text,
+    valid_pinyin_syllables,
+)
 
 APP_TITLE = "HanziLab — китайско-русский словарь"
 FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
@@ -66,7 +72,6 @@ KAITI_FAMILY = "KaiTi"
 XINGSHU_FAMILY = "QXyingbixing"
 INPUT_KAITI_FAMILY = "HanziLab KaiTi CJK"
 RUSSIAN_FONT_FAMILY = "Times New Roman"
-CJK_PATTERN = re.compile(r"[\u3400-\u9fff]")
 
 
 class BackgroundTaskSignals(QObject):
@@ -114,31 +119,9 @@ class BackgroundTask(QRunnable):
         self.signals.finished.emit(self.generation, result, error)
 
 
-def _pinyin_base(text: str) -> str:
-    normalized = unicodedata.normalize("NFD", text.lower().replace("ü", "v"))
-    letters: list[str] = []
-    for character in normalized:
-        if character == "\N{COMBINING DIAERESIS}" and letters:
-            if letters[-1] == "u":
-                letters[-1] = "v"
-        elif not unicodedata.combining(character) and character.isalpha():
-            letters.append(character)
-    return "".join(letters)
-
-
-@lru_cache(maxsize=1)
-def _valid_pinyin_syllables() -> frozenset[str]:
-    syllables = {
-        _pinyin_base(reading)
-        for readings in PINYIN_DICT.values()
-        for reading in readings.split(",")
-    }
-    return frozenset(syllable for syllable in syllables if syllable)
-
-
 def _split_compact_pinyin(value: str, syllable_count: int) -> list[str] | None:
     compact = _pinyin_base(value)
-    valid = _valid_pinyin_syllables()
+    valid = valid_pinyin_syllables()
 
     @cache
     def split(position: int, remaining: int) -> tuple[str, ...] | None:
@@ -164,7 +147,7 @@ def readable_pinyin(hanzi: str, pinyin: str) -> str:
     """Разделяет слитный пиньинь, не подменяя сохранённые чтения и тоны."""
     hanzi = normalize_display_text(hanzi, preserve_line_breaks=False)
     value = normalize_display_text(pinyin, preserve_line_breaks=False)
-    hanzi_characters = CJK_PATTERN.findall(hanzi)
+    hanzi_characters = CJK_RE.findall(hanzi)
     if " " in value or len(hanzi_characters) < 2:
         return value
     generated_bases = [
@@ -193,9 +176,12 @@ def readable_pinyin(hanzi: str, pinyin: str) -> str:
         start = position
         consumed = 0
         while position < len(source) and consumed < len(generated_base):
-            consumed += len(_pinyin_base(source[position]))
-            position += 1
-        while position < len(source) and source[position].isdigit():
+            length = 2 if source[position:position + 2].lower() == "u:" else 1
+            consumed += len(_pinyin_base(source[position:position + length]))
+            position += length
+        while position < len(source) and (
+            source[position].isdigit() or unicodedata.combining(source[position])
+        ):
             position += 1
         syllable = re.sub(r"[\s'’·-]+", "", source[start:position])
         if not syllable or consumed != len(generated_base):
@@ -215,16 +201,10 @@ def load_chinese_fonts() -> None:
             QFontDatabase.addApplicationFont(str(path))
 
 
-def mixed_text_font(chinese_family: str, size: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
-    # Список из китайской и латинской семей заставляет Qt растягивать кириллицу
-    # по метрикам китайского шрифта. Один Times New Roman сохраняет нормальный
-    # интервал, а отсутствующие китайские глифы Qt подбирает через системный fallback.
-    return QFont(RUSSIAN_FONT_FAMILY, size, weight)
-
-
 class ElidedLabel(QLabel):
     def __init__(self, text: str = "") -> None:
         super().__init__()
+        self.setTextFormat(Qt.TextFormat.PlainText)
         self.full_text = text
         self.setMinimumWidth(0)
         self.setToolTip(text)
@@ -262,8 +242,9 @@ class ResultRow(QWidget):
             result["pinyin"], preserve_line_breaks=False
         )
         hanzi = QLabel(hanzi_text)
+        hanzi.setTextFormat(Qt.TextFormat.PlainText)
         hanzi.setObjectName("resultHanzi")
-        character_count = len(CJK_PATTERN.findall(hanzi_text))
+        character_count = len(CJK_RE.findall(hanzi_text))
         hanzi_size = 16 if character_count <= 4 else 14 if character_count <= 6 else 12
         hanzi.setFont(QFont(hanzi_font_family, hanzi_size, QFont.Weight.DemiBold))
         hanzi.setFixedWidth(120)
@@ -285,8 +266,9 @@ class ResultRow(QWidget):
         if len(translation_words) > 3:
             translation_preview += "…"
         translation = QLabel(translation_preview)
+        translation.setTextFormat(Qt.TextFormat.PlainText)
         translation.setObjectName("resultTranslation")
-        translation.setFont(mixed_text_font(hanzi_font_family, 11))
+        translation.setFont(QFont(RUSSIAN_FONT_FAMILY, 11))
         translation.setToolTip(translation_text)
         translation.setWordWrap(True)
         translation.setMaximumHeight(36)
@@ -337,6 +319,8 @@ class HanziLabWindow(QMainWindow):
         self.page_stack.setObjectName("pageStack")
         self.page_stack.addWidget(self.create_content())
         self.page_stack.addWidget(self.create_cards_page())
+        self.cursive_page = CursivePage(self)
+        self.page_stack.addWidget(self.cursive_page)
         shell.addWidget(self.page_stack, 1)
 
         self.search_timer = QTimer(self)
@@ -412,6 +396,12 @@ class HanziLabWindow(QMainWindow):
         self.update_cards_button(self.study_repository.get_card_count())
         layout.addWidget(self.cards_button)
 
+        self.cursive_button = QPushButton("Скоропись")
+        self.cursive_button.setObjectName("navButton")
+        self.cursive_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cursive_button.clicked.connect(lambda: self.show_page(2))
+        layout.addWidget(self.cursive_button)
+
         reviews = QPushButton("Повторение")
         reviews.setObjectName("navDisabled")
         reviews.setToolTip("Появится на следующем этапе")
@@ -442,7 +432,8 @@ class HanziLabWindow(QMainWindow):
         self.page_stack.setCurrentIndex(index)
         self.dictionary_button.setObjectName("navActive" if index == 0 else "navButton")
         self.cards_button.setObjectName("navActive" if index == 1 else "navButton")
-        for button in (self.dictionary_button, self.cards_button):
+        self.cursive_button.setObjectName("navActive" if index == 2 else "navButton")
+        for button in (self.dictionary_button, self.cards_button, self.cursive_button):
             button.style().unpolish(button)
             button.style().polish(button)
         if index == 1:
@@ -519,6 +510,7 @@ class HanziLabWindow(QMainWindow):
 
         result_line = QHBoxLayout()
         self.result_title = QLabel("Начните поиск")
+        self.result_title.setTextFormat(Qt.TextFormat.PlainText)
         self.result_title.setObjectName("resultTitle")
         self.result_count = QLabel("")
         self.result_count.setObjectName("resultCount")
@@ -595,6 +587,7 @@ class HanziLabWindow(QMainWindow):
         self.add_card_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.add_card_button.clicked.connect(self.add_current_card)
         self.detail_hanzi = QLabel()
+        self.detail_hanzi.setTextFormat(Qt.TextFormat.PlainText)
         self.detail_hanzi.setObjectName("detailHanzi")
         self.detail_hanzi.setFont(QFont(self.hanzi_font_family, 52, QFont.Weight.Bold))
         self.detail_hanzi.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -602,10 +595,33 @@ class HanziLabWindow(QMainWindow):
         self.copybook_button.setObjectName("createCopybookButton")
         self.copybook_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.copybook_button.setToolTip(
-            "Создать PDF с порядком черт и клетками для тренировки"
+            "Выбрать стиль и создать PDF с порядком черт"
         )
-        self.copybook_button.clicked.connect(self.create_copybook_pdf)
+        self.copybook_menu = QMenu(self.copybook_button)
+        self.copybook_menu.setObjectName("copybookMenu")
+        self.copybook_kaiti_action = self.copybook_menu.addAction(
+            "楷书 · стандартные прописи"
+        )
+        self.copybook_kaiti_action.setObjectName("copybookKaitiAction")
+        self.copybook_kaiti_action.setToolTip(
+            "Точный порядок черт в стандартном стиле 楷书"
+        )
+        self.copybook_xingshu_action = self.copybook_menu.addAction(
+            "行书 · прописи XingShu"
+        )
+        self.copybook_xingshu_action.setObjectName("copybookXingshuAction")
+        self.copybook_xingshu_action.setToolTip(
+            "Образцы XingShu с последовательностью написания черт"
+        )
+        self.copybook_kaiti_action.triggered.connect(
+            lambda _checked=False: self.create_copybook_pdf(CopybookStyle.KAITI)
+        )
+        self.copybook_xingshu_action.triggered.connect(
+            lambda _checked=False: self.create_copybook_pdf(CopybookStyle.XINGSHU)
+        )
+        self.copybook_button.setMenu(self.copybook_menu)
         self.detail_pinyin = QLabel()
+        self.detail_pinyin.setTextFormat(Qt.TextFormat.PlainText)
         self.detail_pinyin.setObjectName("detailPinyin")
         self.detail_pinyin.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
@@ -616,8 +632,9 @@ class HanziLabWindow(QMainWindow):
         translation_label = QLabel("ПЕРЕВОД")
         translation_label.setObjectName("detailLabel")
         self.detail_translation = QLabel()
+        self.detail_translation.setTextFormat(Qt.TextFormat.PlainText)
         self.detail_translation.setObjectName("detailTranslation")
-        self.detail_translation.setFont(mixed_text_font(self.hanzi_font_family, 13))
+        self.detail_translation.setFont(QFont(RUSSIAN_FONT_FAMILY, 13))
         self.detail_translation.setWordWrap(True)
         self.detail_translation.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
@@ -625,7 +642,7 @@ class HanziLabWindow(QMainWindow):
         self.examples_label.setObjectName("detailLabel")
         self.detail_examples = QLabel()
         self.detail_examples.setObjectName("detailExamples")
-        self.detail_examples.setFont(mixed_text_font(self.hanzi_font_family, 12))
+        self.detail_examples.setFont(QFont(RUSSIAN_FONT_FAMILY, 12))
         self.detail_examples.setWordWrap(True)
         self.detail_examples.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.stroke_order = StrokeOrderPanel(self.hanzi_font_family)
@@ -654,14 +671,21 @@ class HanziLabWindow(QMainWindow):
         self.detail_scroll.setWidget(detail)
         return self.detail_scroll
 
-    def create_copybook_pdf(self) -> None:
+    def create_copybook_pdf(
+        self,
+        style: CopybookStyle = CopybookStyle.KAITI,
+    ) -> None:
         if not self.current_result:
             return
         hanzi = normalize_display_text(
             self.current_result.get("hanzi", ""),
             preserve_line_breaks=False,
         )
-        suggested = Path.home() / "Documents" / suggested_copybook_name(hanzi)
+        suggested = (
+            Path.home()
+            / "Documents"
+            / suggested_copybook_name(hanzi, style)
+        )
         if not suggested.parent.exists():
             suggested = Path.home() / suggested.name
         output_path, _selected_filter = QFileDialog.getSaveFileName(
@@ -673,7 +697,7 @@ class HanziLabWindow(QMainWindow):
         if not output_path:
             return
         try:
-            result = generate_hanzi_copybook(hanzi, output_path)
+            result = generate_hanzi_copybook(hanzi, output_path, style=style)
         except (CopybookError, OSError) as exception:
             QMessageBox.warning(
                 self,
@@ -682,7 +706,9 @@ class HanziLabWindow(QMainWindow):
             )
             return
 
-        message = f"Прописи сохранены:\n{result.path}"
+        message = (
+            f"Прописи {result.style.display_name} сохранены:\n{result.path}"
+        )
         if result.missing_characters:
             message += (
                 "\n\nНет данных о порядке черт для: "
@@ -733,8 +759,6 @@ class HanziLabWindow(QMainWindow):
         self.hanzi_font_family = family
         self.settings.setValue("hanzi_font", family)
         self.detail_hanzi.setFont(QFont(family, 52, QFont.Weight.Bold))
-        self.detail_translation.setFont(mixed_text_font(family, 13))
-        self.detail_examples.setFont(mixed_text_font(family, 12))
         self.stroke_order.set_chinese_font(family)
         self.study_page.set_chinese_font(family)
         self.empty_mark.setFont(QFont(family, 54, QFont.Weight.Normal))
@@ -743,13 +767,10 @@ class HanziLabWindow(QMainWindow):
             item = self.result_list.item(index)
             row = self.result_list.itemWidget(item)
             hanzi = row.findChild(QLabel, "resultHanzi") if row else None
-            translation = row.findChild(QLabel, "resultTranslation") if row else None
             if hanzi:
-                character_count = len(CJK_PATTERN.findall(hanzi.text()))
+                character_count = len(CJK_RE.findall(hanzi.text()))
                 size = 16 if character_count <= 4 else 14 if character_count <= 6 else 12
                 hanzi.setFont(QFont(family, size, QFont.Weight.DemiBold))
-            if translation:
-                translation.setFont(mixed_text_font(family, 11))
 
         current_row = self.result_list.currentRow()
         if self.current_result and 0 <= current_row < len(self.results):
@@ -786,7 +807,7 @@ class HanziLabWindow(QMainWindow):
         """Keep normal queries compact while making entered hanzi easy to inspect."""
         font = QFont()
         font.setFamilies([INPUT_KAITI_FAMILY, RUSSIAN_FONT_FAMILY])
-        font.setPointSize(22 if CJK_PATTERN.search(text) else 13)
+        font.setPointSize(22 if CJK_RE.search(text) else 13)
         self.search_input.setFont(font)
 
     def show_empty_state(self) -> None:
@@ -941,30 +962,9 @@ class HanziLabWindow(QMainWindow):
         self.detail_scroll.verticalScrollBar().setValue(0)
 
     def format_examples(self, examples: list[dict]) -> str:
-        example_blocks = []
-        for example in examples:
-            formatted_lines = []
-            chinese = normalize_display_text(example["chinese"])
-            if chinese:
-                formatted_lines.append(
-                    mixed_script_html(
-                        chinese,
-                        self.hanzi_font_family,
-                        14,
-                        RUSSIAN_FONT_FAMILY,
-                        12,
-                    )
-                )
-            for raw_value in (example["pinyin"], example["translation"]):
-                value = normalize_display_text(raw_value)
-                if value:
-                    formatted_lines.append(
-                        f'<span style="font-family:\'{html.escape(RUSSIAN_FONT_FAMILY)}\'; '
-                        f'font-size:12pt;">{html.escape(value).replace(chr(10), "<br>")}</span>'
-                    )
-            if formatted_lines:
-                example_blocks.append("<br>".join(formatted_lines))
-        return "<br>".join(example_blocks)
+        return format_example_blocks(
+            examples, self.hanzi_font_family, 14, RUSSIAN_FONT_FAMILY
+        )
 
     def add_current_card(self) -> None:
         if not self.current_result:
@@ -1052,6 +1052,26 @@ QComboBox#fontSelector:hover { border-color: #496069; }
 QComboBox#fontSelector::drop-down { border: none; width: 24px; }
 QComboBox#fontSelector QAbstractItemView { background: #17262C; color: #EAF0F2; border: 1px solid #2A3C43; selection-background-color: #E05945; outline: none; }
 QWidget#content { background: #F4F6F8; }
+QWidget#cursivePage { background: #F4F6F8; color: #182026; }
+QLineEdit#cursiveSearch { background: #FFFFFF; color: #243139; border: 1px solid #DCE2E5; border-radius: 10px; padding: 2px 13px; font-size: 15px; }
+QLineEdit#cursiveSearch:focus { border-color: #E05945; }
+QTableWidget#cursiveTable { background: #FFFFFF; color: #1B272C; gridline-color: #E1E6E8; border: 1px solid #DFE4E6; border-radius: 10px; outline: none; selection-background-color: #FFF1ED; selection-color: #C94D3C; }
+QTableWidget#cursiveTable::item { color: #1B272C; }
+QTableWidget#cursiveTable::item:hover { background: #F8FAFA; }
+QTableWidget#cursiveTable::item:selected { background: #FFF1ED; color: #C94D3C; }
+QFrame#cursiveDetail { background: #FFFFFF; border: 1px solid #DFE4E6; border-radius: 12px; }
+QScrollArea#cursiveDetailScroll { background: #F4F6F8; border: none; }
+QLabel#cursiveHeading { color: #152126; background: transparent; border: none; }
+QLabel#cursivePreview { background: #FFFFFF; color: #7B888E; border: 1px solid #E2E7E9; border-radius: 10px; padding: 6px; font-size: 13px; }
+QComboBox#cursiveVariant { background: #F4F7F8; color: #344249; border: 1px solid #D7DEE1; border-radius: 8px; padding: 8px 28px 8px 12px; font-size: 13px; }
+QComboBox#cursiveVariant:disabled { color: #75838A; }
+QComboBox#cursiveVariant::drop-down { border: none; width: 24px; }
+QComboBox#cursiveVariant QAbstractItemView { background: #FFFFFF; color: #344249; selection-background-color: #FFF1ED; selection-color: #C94D3C; border: 1px solid #D7DEE1; }
+QPushButton#cursiveSaveButton { background: #E05945; color: #FFFFFF; border: none; border-radius: 9px; padding: 11px 15px; font-size: 13px; font-weight: 700; }
+QPushButton#cursiveSaveButton:hover { background: #C94D3C; }
+QPushButton#cursiveSaveButton:disabled { background: #D9E0E3; color: #89969C; }
+QPushButton#cursiveOpenButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 9px 13px; font-size: 12px; }
+QPushButton#cursiveOpenButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
 QLabel#pageTitle { color: #182026; font-size: 28px; font-weight: 700; }
 QLabel#pageSubtitle { color: #6E7C83; font-size: 13px; }
 QFrame#searchShell { background: #FFFFFF; border: 1px solid #DCE2E5; border-radius: 13px; }
@@ -1098,6 +1118,9 @@ QLabel#detailPinyin { color: #D45240; font-size: 18px; font-weight: 600; }
 QPushButton#createCopybookButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 9px 13px; font-size: 12px; font-weight: 600; }
 QPushButton#createCopybookButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
 QPushButton#createCopybookButton:pressed { background: #FADFD9; color: #B44334; }
+QMenu#copybookMenu { background: #FFFFFF; color: #334249; border: 1px solid #D7DEE1; border-radius: 9px; padding: 5px; }
+QMenu#copybookMenu::item { border-radius: 7px; padding: 9px 16px; }
+QMenu#copybookMenu::item:selected { background: #FFF1ED; color: #C94D3C; }
 QPushButton#addCardButton { background: #F4F7F8; color: #344249; border: 1px solid #D7DEE1; border-radius: 8px; padding: 8px 12px; font-size: 12px; font-weight: 600; }
 QPushButton#addCardButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
 QPushButton#addCardButton:disabled { background: #EFF6F2; color: #568269; border-color: #D6E7DC; }

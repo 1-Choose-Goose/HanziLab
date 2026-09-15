@@ -2,7 +2,11 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import json
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from PySide6.QtCore import Qt
@@ -10,9 +14,10 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog
 
 import desktop
-from handwriting import recognize_handwriting
+from handwriting import _resample, handwriting_index, recognize_handwriting
 from handwriting_view import HandwritingDialog
 from stroke_order import load_character_data
+from study_database import StudyRepository
 
 
 def median_strokes(character: str):
@@ -31,11 +36,42 @@ class HandwritingRecognitionTests(unittest.TestCase):
                 character,
             )
 
+    def test_damaged_character_does_not_prevent_loading_other_candidates(self):
+        data = load_character_data("你")
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "你.json").write_text(json.dumps(data), encoding="utf-8")
+            (Path(folder) / "好.json").write_text("[]", encoding="utf-8")
+            (Path(folder) / "学.json").write_text(
+                '{"strokes": ["M0 0"], "medians": [[[1, "bad"]]]}', encoding="utf-8",
+            )
+            with patch("stroke_order.STROKE_DATA_DIR", Path(folder)):
+                handwriting_index.cache_clear()
+                load_character_data.cache_clear()
+                try:
+                    candidates = handwriting_index()
+                    self.assertEqual([character for values in candidates.values() for character, _ in values], ["你"])
+                finally:
+                    handwriting_index.cache_clear()
+                    load_character_data.cache_clear()
+
+    def test_resampling_a_single_requested_point_does_not_divide_by_zero(self):
+        self.assertEqual(_resample([(1.0, 2.0), (3.0, 4.0)], count=1), [(1.0, 2.0)])
+        self.assertEqual(_resample([(1.0, 2.0)], count=0), [])
+
 
 class HandwritingUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+        handwriting_index()
+
+    def create_window(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        repository = StudyRepository(Path(folder.name) / "study.db")
+        window = desktop.HanziLabWindow(study_repository=repository)
+        self.addCleanup(window.close)
+        return window
 
     def test_candidate_can_be_composed_for_search(self):
         dialog = HandwritingDialog("KaiTi")
@@ -48,6 +84,57 @@ class HandwritingUiTests(unittest.TestCase):
         self.assertEqual(dialog.composition.font().family(), "KaiTi")
         self.assertTrue(dialog.insert_button.isEnabled())
         dialog.close()
+
+    def test_new_stroke_clears_candidates_from_the_previous_drawing(self):
+        dialog = HandwritingDialog("KaiTi")
+        try:
+            dialog.finish_recognition(dialog.generation, ["你"], None)
+            previous_generation = dialog.generation
+            dialog.canvas.strokes = [[(0.1, 0.1), (0.8, 0.1)]]
+            dialog.schedule_recognition()
+            dialog.select_candidate(0)
+            self.assertEqual(dialog.selected_text(), "")
+            dialog.finish_recognition(previous_generation, ["好"], None)
+            self.assertTrue(all(not button.text() for button in dialog.candidate_buttons))
+        finally:
+            dialog.close()
+
+    def test_accept_and_reject_cancel_pending_recognition(self):
+        for result in (QDialog.DialogCode.Accepted, QDialog.DialogCode.Rejected):
+            with self.subTest(result=result):
+                dialog = HandwritingDialog("KaiTi")
+                dialog.show()
+                dialog.canvas.strokes = [[(0.1, 0.1), (0.8, 0.1)]]
+                dialog.schedule_recognition()
+                generation = dialog.generation
+                dialog.accept() if result == QDialog.DialogCode.Accepted else dialog.reject()
+                self.assertFalse(dialog.recognition_timer.isActive())
+                self.assertGreater(dialog.generation, generation)
+                self.assertEqual(dialog.result(), result)
+
+    def test_cancelled_queued_tasks_release_their_references(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def warm_index():
+            started.set()
+            release.wait(5)
+            return {}
+
+        with patch("handwriting_view.handwriting_index", side_effect=warm_index):
+            dialog = HandwritingDialog("KaiTi")
+            try:
+                self.assertTrue(started.wait(2))
+                dialog.canvas.strokes = [[(0.1, 0.1), (0.8, 0.1)]]
+                dialog.start_recognition()
+                self.assertEqual(len(dialog.tasks), 2)
+                dialog.schedule_recognition()
+                self.assertEqual(len(dialog.tasks), 1)
+            finally:
+                release.set()
+                dialog.pool.waitForDone(5000)
+                self.app.processEvents()
+                dialog.close()
 
     def test_candidate_results_do_not_move_the_drawing_canvas(self):
         dialog = HandwritingDialog("KaiTi")
@@ -83,7 +170,7 @@ class HandwritingUiTests(unittest.TestCase):
         dialog.close()
 
     def test_selected_handwriting_is_inserted_at_search_cursor(self):
-        window = desktop.HanziLabWindow()
+        window = self.create_window()
         window.search_input.setText("学")
         window.search_input.setCursorPosition(0)
         with patch.object(desktop, "HandwritingDialog") as dialog_class:
@@ -97,7 +184,7 @@ class HandwritingUiTests(unittest.TestCase):
         window.close()
 
     def test_search_input_enlarges_hanzi_but_keeps_other_queries_compact(self):
-        window = desktop.HanziLabWindow()
+        window = self.create_window()
         self.assertGreaterEqual(window.search_input.minimumHeight(), 60)
 
         window.search_input.setText("学习")

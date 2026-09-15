@@ -5,12 +5,43 @@ from pathlib import Path
 from study_database import StudyRepository
 from text_formatting import (
     card_translation_without_pinyin,
+    format_example_blocks,
     mixed_script_html,
     normalize_display_text,
 )
 
 
 class TextFormattingTests(unittest.TestCase):
+    def test_latin_annotations_are_not_all_mistaken_for_pinyin(self):
+        source = "значение [formal] [noun] [verb] [A] [народное]\n[de]\n[dōngxī]"
+        self.assertEqual(
+            card_translation_without_pinyin(source),
+            "значение [formal] [noun] [verb] [A] [народное]",
+        )
+
+    def test_ambiguous_toneless_annotations_use_the_actual_card_reading(self):
+        self.assertEqual(
+            card_translation_without_pinyin("[name] [can] [long] [de] [le]", "de; le"),
+            "[name] [can] [long]",
+        )
+        self.assertEqual(card_translation_without_pinyin("[na me]", "nà me"), "")
+
+    def test_pinyin_annotations_accept_decomposed_and_numeric_tones(self):
+        self.assertEqual(
+            card_translation_without_pinyin("[nu\u0308\u030c] [nu:3] [nǚ] [liáotiānr] [ma6]"),
+            "[ma6]",
+        )
+
+    def test_examples_escape_text_and_format_chinese_in_translations(self):
+        rendered = format_example_blocks(
+            [{"chinese": "\n\n", "translation": "<b>значение</b>: 学习"}],
+            "KaiTi", 17, "Times New Roman",
+        )
+        self.assertIn("&lt;b&gt;значение&lt;/b&gt;", rendered)
+        self.assertIn("font-family:'KaiTi'; font-size:17pt;\">学习", rendered)
+        self.assertNotIn("<br><br>", rendered)
+        self.assertEqual(format_example_blocks([{}], "KaiTi", 17, "Times New Roman"), "")
+
     def test_card_translation_hides_pinyin_but_keeps_russian_annotations(self):
         source = (
             "вещь, предмет [народное]\n"

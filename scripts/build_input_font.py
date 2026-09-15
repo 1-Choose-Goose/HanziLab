@@ -16,27 +16,27 @@ def main() -> None:
     options.name_IDs = [0, 1, 2, 3, 4, 5, 6]
     options.name_legacy = True
     options.name_languages = [0x409]
-    font = subset.load_font(str(SOURCE), options)
-    subsetter = subset.Subsetter(options=options)
-    subsetter.populate(
-        unicodes=set(range(0x3000, 0x3040))
-        | set(range(0x3400, 0x4DC0))
-        | set(range(0x4E00, 0xA000))
-        | set(range(0xF900, 0xFB00))
-    )
-    subsetter.subset(font)
+    with subset.load_font(str(SOURCE), options) as font:
+        subsetter = subset.Subsetter(options=options)
+        subsetter.populate(
+            unicodes=set(range(0x3000, 0x3040))
+            | set(range(0x3400, 0x4DC0))
+            | set(range(0x4E00, 0xA000))
+            | set(range(0xF900, 0xFB00))
+        )
+        subsetter.subset(font)
 
-    for record in font["name"].names:
-        if record.nameID in {1, 4}:
-            record.string = FAMILY.encode(record.getEncoding())
-        elif record.nameID == 2:
-            record.string = "Regular".encode(record.getEncoding())
-        elif record.nameID == 3 or record.nameID == 6:
-            record.string = "HanziLabKaiTiCJK-Regular".encode(record.getEncoding())
+        for record in font["name"].names:
+            if record.nameID in {1, 4}:
+                record.string = FAMILY.encode(record.getEncoding())
+            elif record.nameID == 2:
+                record.string = "Regular".encode(record.getEncoding())
+            elif record.nameID in {3, 6}:
+                record.string = "HanziLabKaiTiCJK-Regular".encode(record.getEncoding())
 
-    subset.save_font(font, str(OUTPUT), options)
-    verified = TTFont(OUTPUT)
-    codepoints = set().union(*(table.cmap.keys() for table in verified["cmap"].tables))
+        subset.save_font(font, str(OUTPUT), options)
+    with TTFont(OUTPUT) as verified:
+        codepoints = set().union(*(table.cmap.keys() for table in verified["cmap"].tables))
     assert ord("你") in codepoints
     assert ord("А") not in codepoints
     assert ord("A") not in codepoints

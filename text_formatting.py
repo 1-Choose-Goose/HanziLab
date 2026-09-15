@@ -3,7 +3,10 @@ from __future__ import annotations
 import html
 import re
 import unicodedata
+from functools import lru_cache
 from itertools import groupby
+
+from scripts.text_normalization import CJK_RE, PINYIN_VARIANT_RE, normalize_pinyin
 
 _HORIZONTAL_WHITESPACE_RE = re.compile(r"[^\S\n]+")
 _INVISIBLE_FORMATTING_RE = re.compile(r"[\u00ad\u200b\u2060\ufeff]")
@@ -32,40 +35,91 @@ def normalize_display_text(
     return separator.join(non_empty_lines)
 
 
-def _looks_like_pinyin_annotation(text: str) -> bool:
-    """Recognize Latin pinyin notes without mistaking Russian labels for them."""
+@lru_cache(maxsize=1)
+def valid_pinyin_syllables() -> frozenset[str]:
+    from pypinyin.constants import PINYIN_DICT
+
+    return frozenset(
+        normalized
+        for readings in PINYIN_DICT.values()
+        for reading in readings.split(",")
+        if (normalized := normalize_pinyin(reading))
+    )
+
+
+def _is_pinyin_word(value: str) -> bool:
+    valid = valid_pinyin_syllables()
+    if value in valid:
+        return True
+    reachable = {0}
+    for start in range(len(value)):
+        if start not in reachable:
+            continue
+        for end in range(start + 1, min(len(value), start + 7) + 1):
+            syllable = value[start:end]
+            # Standalone syllabic consonants must not make English words such
+            # as "noun" look like the concatenation "nou" + "n".
+            if syllable in {"m", "n", "ng", "hm", "hng"}:
+                continue
+            if syllable in valid or (syllable.endswith("r") and syllable[:-1] in valid):
+                reachable.add(end)
+    return len(value) in reachable
+
+
+def _looks_like_pinyin_annotation(text: str, known_readings: set[str] | None) -> bool:
+    """Validate readings; retain Latin labels and ambiguous unrelated words."""
+    text = unicodedata.normalize("NFC", text.strip())
     has_lowercase_latin = False
-    for character in text.strip():
+    for character in text:
         if character.isalpha():
             if "LATIN" not in unicodedata.name(character, ""):
                 return False
             has_lowercase_latin = has_lowercase_latin or character.islower()
         elif (
-            character.isdigit()
+            character in "12345"
             or character.isspace()
             or character in "'\u2019·,;:/|.-–—()"
+            or unicodedata.combining(character)
         ):
             continue
         else:
             return False
     # Uppercase A/B and Roman section numbers are grammatical labels, not
     # readings, and therefore stay visible.
-    return has_lowercase_latin
+    if not has_lowercase_latin:
+        return False
+    tokens = re.split(r"[\s'’·,;:/|.()–—-]+", text.lower().replace("u:", "v"))
+    if not all(_is_pinyin_word(normalize_pinyin(token)) for token in tokens if token):
+        return False
+    has_tone = any(
+        character in "12345\u0300\u0301\u0304\u030c"
+        for character in unicodedata.normalize("NFD", text)
+    )
+    if known_readings is not None and not has_tone:
+        return all(
+            normalize_pinyin(part) in known_readings
+            for part in PINYIN_VARIANT_RE.split(text)
+        )
+    return True
 
 
-def card_translation_without_pinyin(text: object) -> str:
+def card_translation_without_pinyin(text: object, pinyin: str | None = None) -> str:
     """Hide dictionary pronunciation annotations only on a card's Russian side."""
     cleaned_lines: list[str] = []
+    known_readings = (
+        {normalize_pinyin(part) for part in PINYIN_VARIANT_RE.split(pinyin)}
+        if pinyin is not None else None
+    )
     for raw_line in normalize_display_text(text).splitlines():
         line = _BRACKETED_ANNOTATION_RE.sub(
             lambda match: (
-                "" if _looks_like_pinyin_annotation(match.group(1)) else match.group(0)
+                "" if _looks_like_pinyin_annotation(match.group(1), known_readings) else match.group(0)
             ),
             raw_line,
         )
         line = normalize_display_text(line, preserve_line_breaks=False)
         section = _SECTION_READING_RE.fullmatch(line)
-        if section and _looks_like_pinyin_annotation(section.group("reading")):
+        if section and _looks_like_pinyin_annotation(section.group("reading"), known_readings):
             line = section.group("label").replace(" ", "")
         if line:
             cleaned_lines.append(line)
@@ -73,12 +127,7 @@ def card_translation_without_pinyin(text: object) -> str:
 
 
 def is_cjk(character: str) -> bool:
-    codepoint = ord(character)
-    return (
-        0x3400 <= codepoint <= 0x9FFF
-        or 0xF900 <= codepoint <= 0xFAFF
-        or 0x20000 <= codepoint <= 0x3134F
-    )
+    return CJK_RE.fullmatch(character) is not None
 
 
 def mixed_script_html(
@@ -100,3 +149,27 @@ def mixed_script_html(
             f"{value}</span>"
         )
     return "".join(parts)
+
+
+def format_example_blocks(
+    examples: list[dict],
+    chinese_family: str,
+    chinese_size: int,
+    text_family: str,
+    text_size: int = 12,
+) -> str:
+    """Render dictionary and study examples with consistent escaping and fonts."""
+    blocks: list[str] = []
+    for example in examples:
+        lines: list[str] = []
+        for field in ("chinese", "pinyin", "translation"):
+            value = normalize_display_text(example.get(field))
+            if value:
+                lines.append(
+                    mixed_script_html(
+                        value, chinese_family, chinese_size, text_family, text_size
+                    )
+                )
+        if lines:
+            blocks.append("<br>".join(lines))
+    return "<br>".join(blocks)

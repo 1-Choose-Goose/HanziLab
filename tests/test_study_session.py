@@ -6,7 +6,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from scheduler import CardState, LearningState, Rating, ReviewDirection, preview_ratings
-from study_database import StudyRepository, initialize_study_database, local_date
+from study_database import (
+    SCHEMA_VERSION,
+    StudyRepository,
+    initialize_study_database,
+    local_date,
+)
 from study_session import StudySessionService, choose_direction, select_daily_cards
 
 NOW = datetime(2026, 8, 10, 9, 0, tzinfo=timezone.utc)
@@ -91,6 +96,13 @@ class SelectionTests(unittest.TestCase):
         )
         self.assertIn(50, {item.card_id for item in selected})
 
+    def test_shuffle_does_not_move_new_cards_before_due_learning_cards(self):
+        selected = select_daily_cards(
+            [card(1), card(2, LearningState.LEARNING, NOW)],
+            set(), 2, NOW, DeterministicRng(),
+        )
+        self.assertEqual([item.card_id for item in selected], [2, 1])
+
     def test_future_review_cards_are_not_taken_early(self):
         due = [card(i, LearningState.REVIEW, NOW) for i in range(1, 16)]
         new = [card(i) for i in range(100, 105)]
@@ -121,6 +133,17 @@ class RepositoryIntegrationTests(unittest.TestCase):
         self.assertFalse(self.repository.add_card("", "pinyin", "перевод"))
         self.assertFalse(self.repository.add_card("词", "", "перевод"))
         self.assertFalse(self.repository.add_card("词", "cí", ""))
+        self.assertEqual(self.repository.get_card_count(), 0)
+
+    def test_card_lookup_priority_and_removal_use_insertion_normalization(self):
+        raw_word = " \ufeff学\u200b校\u2060 "
+        self.assertTrue(self.repository.add_card(raw_word, "xué xiào", "школа"))
+        self.assertTrue(self.repository.has_card(raw_word))
+        with closing(self.repository.connect()) as connection, connection:
+            connection.execute("UPDATE cards SET learning_state='REVIEW'")
+        self.assertTrue(self.repository.can_raise_card_priority(raw_word))
+        self.assertTrue(self.repository.raise_card_priority(raw_word))
+        self.assertTrue(self.repository.remove_card(raw_word))
         self.assertEqual(self.repository.get_card_count(), 0)
 
     def test_bulk_add_is_atomic_and_does_not_overwrite_existing_card(self):
@@ -344,6 +367,84 @@ class RepositoryIntegrationTests(unittest.TestCase):
         rerendered = resumed_service.next_item(resumed_at + timedelta(minutes=1))
         self.assertEqual(rerendered.shown_at, resumed_at)
 
+    def test_active_card_stays_visible_when_another_pair_is_pending(self):
+        self.repository.add_card("猫", "māo", "кошка")
+        self.repository.add_card("狗", "gǒu", "собака")
+        service = StudySessionService(self.repository, DeterministicRng([0, 0, 1]))
+        first = service.next_item(NOW)
+        service.answer(first, Rating.MEDIUM, NOW, 100)
+        active = service.next_item(NOW + timedelta(seconds=1))
+        self.assertNotEqual(active.card.id, first.card.id)
+
+        # The next random choice would have selected the pending opposite side.
+        rerendered = service.next_item(NOW + timedelta(seconds=2))
+        self.assertEqual(rerendered.presentation_id, active.presentation_id)
+        restarted = StudySessionService(self.repository, DeterministicRng([0]))
+        resumed = restarted.next_item(NOW + timedelta(minutes=1))
+        self.assertEqual(resumed.presentation_id, active.presentation_id)
+
+    def test_pending_pair_keeps_its_daily_slot_when_limit_is_reduced(self):
+        for index in range(3):
+            self.repository.add_card(f"词{index}", "cí", "слово")
+        self.repository.set_daily_limit(3, NOW)
+        service = StudySessionService(self.repository, DeterministicRng([0]))
+        service.ensure_daily_session(NOW)
+        rows = self.repository.daily_rows(local_date(NOW))
+        pending_id = int(rows[-1]["card_id"])
+        with closing(self.repository.connect()) as connection, connection:
+            connection.execute(
+                "UPDATE daily_cards SET position=0 WHERE card_id=?", (pending_id,)
+            )
+        first = service.next_item(NOW)
+        # Force the pair to the end so trimming cannot retain it accidentally.
+        service.answer(first, Rating.MEDIUM, NOW, 100)
+        with closing(self.repository.connect()) as connection, connection:
+            connection.execute(
+                "UPDATE daily_cards SET position=99 WHERE card_id=?", (first.card.id,)
+            )
+        self.repository.set_daily_limit(1, NOW)
+        retained = self.repository.daily_rows(local_date(NOW))
+        self.assertEqual([int(row["card_id"]) for row in retained], [first.card.id])
+        second = service.next_item(NOW + timedelta(seconds=1))
+        service.answer(second, Rating.MEDIUM, NOW + timedelta(seconds=1), 100)
+        self.assertEqual(service.progress(NOW), (1, 1))
+
+    def test_pending_pair_reserves_next_days_slot_before_new_cards(self):
+        self.repository.add_card("旧", "jiù", "старый")
+        self.repository.set_daily_limit(1, NOW)
+        with closing(self.repository.connect()) as connection, connection:
+            connection.execute(
+                "UPDATE cards SET learning_state='REVIEW', next_review_at=?",
+                (NOW.isoformat(),),
+            )
+        service = StudySessionService(self.repository, DeterministicRng([0]))
+        first = service.next_item(NOW)
+        service.answer(first, Rating.MEDIUM, NOW, 100)
+        self.repository.add_card("新", "xīn", "новый")
+        tomorrow = NOW + timedelta(days=1)
+        restarted = StudySessionService(self.repository, DeterministicRng([0]))
+        second = restarted.next_item(tomorrow)
+        self.assertEqual(second.card.id, first.card.id)
+        self.assertNotEqual(second.direction, first.direction)
+        self.assertEqual(
+            [int(row["card_id"]) for row in self.repository.daily_rows(local_date(tomorrow))],
+            [first.card.id],
+        )
+        restarted.answer(second, Rating.MEDIUM, tomorrow, 100)
+        self.assertEqual(restarted.progress(tomorrow), (1, 1))
+        self.assertIsNone(restarted.next_item(tomorrow))
+
+    def test_answer_after_midnight_counts_the_visible_card_in_new_day(self):
+        self.repository.add_card("旧", "jiù", "старый")
+        self.repository.set_daily_limit(1, NOW)
+        service = StudySessionService(self.repository, DeterministicRng([0]))
+        first = service.next_item(NOW)
+        service.answer(first, Rating.MEDIUM, NOW, 100)
+        second = service.next_item(NOW + timedelta(seconds=1))
+        tomorrow = NOW + timedelta(days=1)
+        service.answer(second, Rating.MEDIUM, tomorrow, 100)
+        self.assertEqual(service.progress(tomorrow), (1, 1))
+
     def test_lower_daily_limit_trims_only_unfinished_unopened_rows(self):
         for index in range(1, 31):
             self.repository.add_card(f"词{index}", f"cí {index}", f"слово {index}")
@@ -536,7 +637,7 @@ class RepositoryIntegrationTests(unittest.TestCase):
             ).fetchall()
             self.assertEqual(active, [(2,)])
             self.assertEqual(pending, [(2,)])
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
 
 

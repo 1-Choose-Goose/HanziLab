@@ -6,9 +6,16 @@ import threading
 import unicodedata
 from contextlib import closing
 from functools import lru_cache
+from itertools import product
 from pathlib import Path
 
-from scripts.text_normalization import normalize_pinyin, normalize_translation
+from scripts.text_normalization import (
+    CJK_RE,
+    PINYIN_VARIANT_RE,
+    normalize_pinyin,
+    normalize_translation,
+    normalized_pinyin_variants,
+)
 
 ROOT = Path(__file__).resolve().parent
 FULL_DB_PATH = ROOT / "data" / "hanzi.db"
@@ -16,13 +23,7 @@ PLACEHOLDER_DB_PATH = ROOT / "data" / "hanzi-placeholder.db"
 DB_PATH = FULL_DB_PATH if FULL_DB_PATH.exists() else PLACEHOLDER_DB_PATH
 ORIGINAL_VOCABULARY_SIZE = 1204
 
-# Включаем базовый блок, расширения A/B–G и compatibility ideographs.
-CJK_RE = re.compile(
-    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
-    r"\U00020000-\U0002fa1f]"
-)
 CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
-_PINYIN_VARIANT_RE = re.compile(r"[;,/|、]")
 _THREAD_CONNECTION = threading.local()
 _CURATED_CACHE_LOCK = threading.Lock()
 _CURATED_CACHE: dict[str, tuple[tuple[int, str, str, str, str, str], ...]] = {}
@@ -36,6 +37,10 @@ _ENTRY_FTS_SQL = """SELECT e.rowid AS id, e.hanzi, e.pinyin, e.translation, 8 AS
                     WHERE entries_fts MATCH ?
                     ORDER BY entries_fts.rowid
                     LIMIT ?"""
+_PINYIN_FTS_SQL = _ENTRY_FTS_SQL.replace(
+    "ORDER BY entries_fts.rowid",
+    "AND pinyin_matches(e.pinyin, ?) ORDER BY entries_fts.rowid",
+)
 
 _EXAMPLE_FTS_SQL = """SELECT e.rowid AS id, e.chinese, e.pinyin, e.translation
                       FROM examples_fts
@@ -67,6 +72,11 @@ class _ConnectionHolder:
 
 def _configure_connection(connection: sqlite3.Connection) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
+    connection.create_function(
+        "pinyin_matches", 2,
+        lambda value, query: query in normalized_pinyin_variants(value),
+        deterministic=True,
+    )
     connection.execute("PRAGMA query_only=ON")
     connection.execute("PRAGMA temp_store=MEMORY")
     # mmap уменьшает число копирований страниц большого неизменяемого словаря.
@@ -112,8 +122,8 @@ def get_stats() -> dict[str, int]:
     with closing(connect_dictionary()) as connection:
         # ANALYZE хранит число строк в sqlite_stat1, не требуя COUNT(*)
         # по 3,45 млн элементов. Свежесозданная база может ещё не иметь
-        # sqlite_stat1; импортер вставляет rowid непрерывно, поэтому MAX(rowid) —
-        # быстрый и точный fallback для такой базы.
+        # sqlite_stat1; для таких баз считаем строки явно: rowid может
+        # содержать пропуски после удаления или переноса старых записей.
         try:
             row = connection.execute(
                 "SELECT stat FROM sqlite_stat1 WHERE tbl='entries' LIMIT 1"
@@ -124,7 +134,7 @@ def get_stats() -> dict[str, int]:
             entries = int(row[0].split()[0])
         else:
             entries = int(
-                connection.execute("SELECT COALESCE(MAX(rowid), 0) FROM entries").fetchone()[0]
+                connection.execute("SELECT count(*) FROM entries").fetchone()[0]
             )
     return {"entries": entries, "corrections": 0}
 
@@ -159,13 +169,28 @@ def warm_search_index() -> None:
 
 def _hanzi_query(value: str) -> str:
     value = unicodedata.normalize("NFKC", value)
-    return "".join(CJK_RE.findall(value))
+    if not CJK_RE.search(value):
+        return ""
+    # В китайских заголовках встречаются латинские буквы и цифры: T恤衫, B超.
+    return "".join(char for char in value if CJK_RE.fullmatch(char) or char.isascii() and char.isalnum())
 
 
 def _fts_phrase(column: str, value: str) -> str:
     if column not in {"hanzi", "pinyin", "translation", "chinese"}:
         raise ValueError(f"Unsupported FTS column: {column}")
     return f'{column}:"{value.replace(chr(34), chr(34) * 2)}"'
+
+
+def _pinyin_fts_phrase(value: str) -> str:
+    """Читать и старые индексы, где тонированное ü было записано как u."""
+    # В редком длинном запросе ограничиваем вариативный префикс: не больше
+    # восьми FTS-веток, затем SQL проверяет полное чтение до применения LIMIT.
+    positions = [index for index, char in enumerate(value) if char == "v"]
+    prefix = value[: positions[3]] if len(positions) > 3 else value
+    return " OR ".join(
+        _fts_phrase("pinyin", "".join(chars))
+        for chars in product(*(tuple("vu") if char == "v" else (char,) for char in prefix))
+    )
 
 
 @lru_cache(maxsize=256)
@@ -199,7 +224,7 @@ def _row_rank(item: dict, *, hanzi_query: str, pinyin_query: str, translation_qu
     if pinyin_query:
         variants = [
             normalize_pinyin(part)
-            for part in _PINYIN_VARIANT_RE.split(item["pinyin"])
+            for part in PINYIN_VARIANT_RE.split(item["pinyin"])
             if part.strip()
         ]
         if pinyin_query in variants:
@@ -250,7 +275,7 @@ def _curated_search_rows(
                     row["hanzi"],
                     row["pinyin"],
                     row["translation"],
-                    normalize_pinyin(row["pinyin"]),
+                    normalized_pinyin_variants(row["pinyin"]),
                     normalize_translation(row["translation"]),
                 )
                 for row in rows
@@ -260,7 +285,7 @@ def _curated_search_rows(
 
 
 def search_entries(query: str, limit: int = 50) -> list[dict]:
-    query = query.strip()
+    query = unicodedata.normalize("NFKC", query).strip()
     if not query:
         return []
     limit = min(max(limit, 1), 100)
@@ -318,10 +343,16 @@ def search_entries(query: str, limit: int = 50) -> list[dict]:
             field, value = "translation", translation_query
         else:
             field, value = "pinyin", pinyin_query
-        fts_rows = connection.execute(
-            _ENTRY_FTS_SQL,
-            (_fts_phrase(field, value), fetch_limit),
-        ).fetchall()
+        if pinyin_query:
+            fts_rows = connection.execute(
+                _PINYIN_FTS_SQL,
+                (_pinyin_fts_phrase(value), value, fetch_limit),
+            ).fetchall()
+        else:
+            fts_rows = connection.execute(
+                _ENTRY_FTS_SQL,
+                (_fts_phrase(field, value), fetch_limit),
+            ).fetchall()
         for row in fts_rows:
             collect(row)
     else:

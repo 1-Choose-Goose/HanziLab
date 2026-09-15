@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import html
 from collections.abc import Callable
 from pathlib import Path
 
@@ -40,7 +39,7 @@ from study_database import StudyRepository, utc_now
 from study_session import SessionItem, StudySessionService
 from text_formatting import (
     card_translation_without_pinyin,
-    mixed_script_html,
+    format_example_blocks,
     normalize_display_text,
 )
 
@@ -49,6 +48,13 @@ RATING_KEYS = {
     Rating.HARD: "2",
     Rating.MEDIUM: "3",
     Rating.EASY: "4",
+}
+
+RATING_LABELS = {
+    Rating.VERY_HARD: "Очень тяжело",
+    Rating.HARD: "Тяжело",
+    Rating.MEDIUM: "Средне",
+    Rating.EASY: "Легко",
 }
 
 INPUT_KAITI_FAMILY = "HanziLab KaiTi CJK"
@@ -73,6 +79,9 @@ class DictionaryLookupTask(QRunnable):
     @Slot()
     def run(self) -> None:
         if self.cancelled:
+            self.signals.finished.emit(
+                self.generation, None, RuntimeError("dictionary lookup cancelled")
+            )
             return
         try:
             result = get_entries_by_hanzi(self.words)
@@ -80,8 +89,10 @@ class DictionaryLookupTask(QRunnable):
         except Exception as exception:  # noqa: BLE001 - граница фоновой задачи.
             result = None
             error = exception
-        if not self.cancelled:
-            self.signals.finished.emit(self.generation, result, error)
+        if self.cancelled:
+            result = None
+            error = RuntimeError("dictionary lookup cancelled")
+        self.signals.finished.emit(self.generation, result, error)
 
 
 class ManualCardDialog(QDialog):
@@ -147,6 +158,7 @@ class ManualCardDialog(QDialog):
         self.dictionary_status = QLabel(
             "Введите слово — HanziLab попробует заполнить данные из словаря."
         )
+        self.dictionary_status.setTextFormat(Qt.TextFormat.PlainText)
         self.dictionary_status.setObjectName("manualCardStatus")
         self.dictionary_status.setWordWrap(True)
         root.addWidget(self.dictionary_status)
@@ -193,7 +205,7 @@ class ManualCardDialog(QDialog):
             self.pinyin_input.clear()
             self.translation_input.clear()
             self.autofilled = False
-        word = text.strip()
+        word = normalize_display_text(text, preserve_line_breaks=False)
         if word and self.repository.has_card(word):
             self.show_duplicate(word)
             return
@@ -241,7 +253,7 @@ class ManualCardDialog(QDialog):
         self.set_status(message, "duplicate")
 
     def raise_existing_priority(self) -> None:
-        word = self.hanzi_input.text().strip()
+        word = self.card_data()[0]
         if not word:
             return
         if not self.repository.raise_card_priority(word):
@@ -257,7 +269,7 @@ class ManualCardDialog(QDialog):
         self.priority_raised.emit(word)
 
     def start_dictionary_lookup(self) -> None:
-        word = self.hanzi_input.text().strip()
+        word = self.card_data()[0]
         if not word:
             return
         if self.repository.has_card(word):
@@ -278,7 +290,7 @@ class ManualCardDialog(QDialog):
         if generation != self.lookup_generation:
             return
         self.save_button.setEnabled(True)
-        word = self.hanzi_input.text().strip()
+        word = self.card_data()[0]
         if self.repository.has_card(word):
             self.show_duplicate(word)
             return
@@ -349,12 +361,12 @@ class ManualCardDialog(QDialog):
             normalize_display_text(self.translation_input.toPlainText()),
         )
 
-    def closeEvent(self, event) -> None:
+    def done(self, result: int) -> None:
         self.lookup_generation += 1
         self.lookup_timer.stop()
         for task in tuple(self.lookup_tasks):
             task.cancel()
-        super().closeEvent(event)
+        super().done(result)
 
 
 class ExampleLoadSignals(QObject):
@@ -559,6 +571,7 @@ class StudyPage(QWidget):
         layout = QVBoxLayout(empty)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         mark = QLabel("习")
+        self.empty_mark = mark
         mark.setObjectName("studyEmptyMark")
         mark.setFont(QFont(self.chinese_font_family, 54))
         mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -615,12 +628,6 @@ class StudyPage(QWidget):
         rating_layout.setContentsMargins(0, 0, 0, 0)
         rating_layout.setSpacing(8)
         self.rating_buttons: dict[Rating, QPushButton] = {}
-        labels = {
-            Rating.VERY_HARD: "Очень тяжело",
-            Rating.HARD: "Тяжело",
-            Rating.MEDIUM: "Средне",
-            Rating.EASY: "Легко",
-        }
         objects = {
             Rating.VERY_HARD: "ratingVeryHard",
             Rating.HARD: "ratingHard",
@@ -628,7 +635,7 @@ class StudyPage(QWidget):
             Rating.EASY: "ratingEasy",
         }
         for rating in Rating:
-            button = QPushButton(labels[rating])
+            button = QPushButton(RATING_LABELS[rating])
             button.setObjectName(objects[rating])
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setToolTip(f"Горячая клавиша: {RATING_KEYS[rating]}")
@@ -647,6 +654,7 @@ class StudyPage(QWidget):
         layout.setSpacing(16)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.question = QLabel()
+        self.question.setTextFormat(Qt.TextFormat.PlainText)
         self.question.setObjectName("cardQuestion")
         self.question.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.question.setWordWrap(True)
@@ -670,6 +678,7 @@ class StudyPage(QWidget):
         layout.setContentsMargins(0, 8, 0, 8)
         layout.setSpacing(12)
         self.answer_primary = QLabel()
+        self.answer_primary.setTextFormat(Qt.TextFormat.PlainText)
         self.answer_primary.setObjectName("cardAnswerPrimary")
         self.answer_primary.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.answer_primary.setWordWrap(True)
@@ -688,6 +697,7 @@ class StudyPage(QWidget):
         self.answer_primary_scroll.setMaximumHeight(220)
         self.answer_primary_scroll.setWidget(self.answer_primary)
         self.answer_pinyin = QLabel()
+        self.answer_pinyin.setTextFormat(Qt.TextFormat.PlainText)
         self.answer_pinyin.setObjectName("cardAnswerPinyin")
         self.answer_pinyin.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.show_examples_button = QPushButton("Показать примеры")
@@ -724,6 +734,7 @@ class StudyPage(QWidget):
 
     def set_chinese_font(self, family: str) -> None:
         self.chinese_font_family = family
+        self.empty_mark.setFont(QFont(family, 54))
         self.refresh_current_visuals()
 
     def chinese_card_font(self, text: str) -> QFont:
@@ -993,7 +1004,7 @@ class StudyPage(QWidget):
         pinyin_source = normalize_display_text(
             item.card.pinyin, preserve_line_breaks=False
         )
-        translation = card_translation_without_pinyin(item.card.translation)
+        translation = card_translation_without_pinyin(item.card.translation, item.card.pinyin)
         pinyin = self.pinyin_formatter(hanzi, pinyin_source)
         self.hidden_pinyin.set_pinyin(pinyin)
         if item.direction == ReviewDirection.CHINESE_TO_RUSSIAN:
@@ -1015,7 +1026,7 @@ class StudyPage(QWidget):
         pinyin_source = normalize_display_text(
             card.pinyin, preserve_line_breaks=False
         )
-        translation = card_translation_without_pinyin(card.translation)
+        translation = card_translation_without_pinyin(card.translation, card.pinyin)
         pinyin = self.pinyin_formatter(hanzi, pinyin_source)
         if self.current_item.direction == ReviewDirection.CHINESE_TO_RUSSIAN:
             self.answer_primary.setText(translation)
@@ -1031,14 +1042,8 @@ class StudyPage(QWidget):
         self.card_sides.setCurrentIndex(1)
         self.rating_area.setVisible(True)
         previews = preview_ratings(card, utc_now())
-        labels = {
-            Rating.VERY_HARD: "Очень тяжело",
-            Rating.HARD: "Тяжело",
-            Rating.MEDIUM: "Средне",
-            Rating.EASY: "Легко",
-        }
         for rating, button in self.rating_buttons.items():
-            button.setText(f"{labels[rating]}\n{format_interval(previews[rating])}")
+            button.setText(f"{RATING_LABELS[rating]}\n{format_interval(previews[rating])}")
 
     def open_answer_from_keyboard(self) -> None:
         if (
@@ -1171,30 +1176,9 @@ class StudyPage(QWidget):
         self.show_loaded_examples()
 
     def format_examples(self, examples: list[dict]) -> str:
-        blocks = []
-        for example in examples:
-            formatted = []
-            chinese = normalize_display_text(example["chinese"])
-            if chinese:
-                formatted.append(
-                    mixed_script_html(
-                        chinese,
-                        self.chinese_font_family,
-                        17,
-                        self.russian_font_family,
-                        12,
-                    )
-                )
-            for raw_value in (example["pinyin"], example["translation"]):
-                value = normalize_display_text(raw_value)
-                if value:
-                    formatted.append(
-                        f'<span style="font-family:\'{html.escape(self.russian_font_family)}\'; '
-                        f'font-size:12pt;">{html.escape(value).replace(chr(10), "<br>")}</span>'
-                    )
-            if formatted:
-                blocks.append("<br>".join(formatted))
-        return "<br>".join(blocks) or "Примеры не найдены"
+        return format_example_blocks(
+            examples, self.chinese_font_family, 17, self.russian_font_family
+        ) or "Примеры не найдены"
 
     def rate(self, rating: Rating) -> None:
         # The guard also protects against a queued second click: after the
@@ -1224,7 +1208,10 @@ class StudyPage(QWidget):
             examples_visible = self.examples_scroll.isVisible()
             examples_requested = self.examples_requested_visible
             examples_scroll_position = self.examples_scroll.verticalScrollBar().value()
+            pinyin_revealed = self.hidden_pinyin.revealed
             self.show_item(self.current_item)
+            if pinyin_revealed:
+                self.hidden_pinyin.reveal()
             if current_side == 1:
                 self.show_answer()
             if examples_visible and self.current_examples is not None:

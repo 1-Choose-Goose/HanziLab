@@ -43,6 +43,15 @@ def choose_direction(rng: RandomSource = random) -> ReviewDirection:
     )
 
 
+def _is_available(card: CardState, now: datetime) -> bool:
+    return (
+        card.priority_boost
+        or card.learning_state.value == "NEW"
+        or card.next_review_at is None
+        or ensure_aware(card.next_review_at) <= now
+    )
+
+
 def select_daily_cards(
     cards: list[CardState],
     existing_card_ids: set[int],
@@ -59,7 +68,7 @@ def select_daily_cards(
     # guarantees the central rule: one cardId can occupy only one daily slot.
     available_by_id: dict[int, CardState] = {}
     for card in cards:
-        if card.id not in existing_card_ids:
+        if card.id not in existing_card_ids and _is_available(card, now):
             available_by_id.setdefault(card.id, card)
     available = list(available_by_id.values())
     priority_learning = [
@@ -67,13 +76,7 @@ def select_daily_cards(
         for card in available
         if card.priority_boost
         or card.learning_state.value == "NEW"
-        or (
-            card.learning_state.value == "LEARNING"
-            and (
-                card.next_review_at is None
-                or ensure_aware(card.next_review_at) <= now
-            )
-        )
+        or card.learning_state.value == "LEARNING"
     ]
     priority_learning.sort(
         key=lambda card: (
@@ -96,7 +99,6 @@ def select_daily_cards(
         for card in available
         if not card.priority_boost
         and card.learning_state.value not in {"NEW", "LEARNING"}
-        and (card.next_review_at is None or ensure_aware(card.next_review_at) <= now)
     ]
     due.sort(
         key=lambda card: (
@@ -107,15 +109,21 @@ def select_daily_cards(
         )
     )
     due_selected = due[:remaining]
-    # Ручное повышение, учебные карточки и due не смешиваются между собой.
+    # Каждая группа перемешивается отдельно, сохраняя порядок приоритетов.
     boosted_selected = [card for card in priority_selected if card.priority_boost]
     learning_selected = [
-        card for card in priority_selected if not card.priority_boost
+        card for card in priority_selected
+        if not card.priority_boost and card.learning_state.value == "LEARNING"
+    ]
+    new_selected = [
+        card for card in priority_selected
+        if not card.priority_boost and card.learning_state.value == "NEW"
     ]
     rng.shuffle(boosted_selected)
     rng.shuffle(learning_selected)
+    rng.shuffle(new_selected)
     rng.shuffle(due_selected)
-    selected = boosted_selected + learning_selected + due_selected
+    selected = boosted_selected + learning_selected + new_selected + due_selected
     return [DailySelection(card.id, choose_direction(rng)) for card in selected]
 
 
@@ -159,12 +167,27 @@ class StudySessionService:
             self._prepared_dates[date_key] = preparation_signature
         existing = self.repository.daily_rows(date_key)
         existing_ids = {int(row["card_id"]) for row in existing}
+        start_position = max((int(row["position"]) for row in existing), default=-1) + 1
+        unfinished = [
+            row for row in self.repository.get_unfinished_cards()
+            if int(row["card_id"]) not in existing_ids
+        ]
+        if unfinished:
+            self.repository.add_daily_rows(
+                date_key,
+                [
+                    (int(row["card_id"]), row["direction"], start_position + index)
+                    for index, row in enumerate(unfinished)
+                ],
+                now,
+            )
+            existing_ids.update(int(row["card_id"]) for row in unfinished)
+            start_position += len(unfinished)
         if len(existing_ids) >= limit:
             return
         selections = select_daily_cards(
             self.repository.get_cards(), existing_ids, limit, now, self.rng
         )
-        start_position = max((int(row["position"]) for row in existing), default=-1) + 1
         rows = [
             (selection.card_id, selection.direction.value, start_position + index)
             for index, selection in enumerate(selections)
@@ -179,28 +202,10 @@ class StudySessionService:
             for row in self.repository.daily_rows(local_date(now))
         }
         now = ensure_aware(now)
-        for card in self.repository.get_cards():
-            if card.id in existing_ids:
-                continue
-            if card.priority_boost or card.learning_state.value == "NEW":
-                return True
-            if (
-                card.learning_state.value == "LEARNING"
-                and (
-                    card.next_review_at is None
-                    or ensure_aware(card.next_review_at) <= now
-                )
-            ):
-                return True
-            if (
-                card.learning_state.value not in {"NEW", "LEARNING"}
-                and (
-                    card.next_review_at is None
-                    or ensure_aware(card.next_review_at) <= now
-                )
-            ):
-                return True
-        return False
+        return any(
+            card.id not in existing_ids and _is_available(card, now)
+            for card in self.repository.get_cards()
+        )
 
     def continue_daily_session(self, now: datetime) -> int:
         """Add one more normal-size batch for today and return its actual size."""
@@ -245,7 +250,17 @@ class StudySessionService:
         learning_items = self.repository.get_immediate_learning(now)
         daily_queue = self.repository.get_daily_queue(date_key, now)
         immediate = None
-        if learning_items and daily_queue:
+        active = max(
+            (row for row in learning_items + daily_queue if row["active_presentation_id"]),
+            key=lambda row: int(row["active_presentation_id"]),
+            default=None,
+        )
+        if active is not None:
+            if "learning_queue_id" in active:
+                immediate = active
+            else:
+                daily_queue = [active]
+        elif learning_items and daily_queue:
             if self.rng.choice(["LEARNING", "DAILY"]) == "LEARNING":
                 immediate = self.rng.choice(learning_items)
         elif learning_items:
@@ -291,6 +306,9 @@ class StudySessionService:
         reviewed_at: datetime,
         response_time_ms: int,
     ) -> CardState:
+        # A visible card can be answered after the local date has changed.
+        # Reserve its slot before save_review marks today's logical pair done.
+        self.ensure_daily_session(reviewed_at)
         current = self.repository.get_card(item.card.id)
         if current is None:
             raise LookupError(f"Карточка {item.card.id} не найдена")

@@ -16,6 +16,7 @@ a = Analysis(
         (str(PROJECT_ROOT / "assets" / "fonts"), "assets/fonts"),
         (str(PROJECT_ROOT / "assets" / "icons"), "assets/icons"),
         (str(PROJECT_ROOT / "assets" / "strokes"), "assets/strokes"),
+        (str(PROJECT_ROOT / "assets" / "cursive"), "assets/cursive"),
         (str(DICTIONARY_PATH), "data"),
     ],
     hiddenimports=[],

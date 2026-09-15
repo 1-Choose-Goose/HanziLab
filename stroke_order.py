@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 from functools import lru_cache
 from pathlib import Path
 
@@ -24,15 +25,43 @@ STROKE_DATA_DIR = ROOT / "assets" / "strokes"
 
 @lru_cache(maxsize=256)
 def load_character_data(character: str) -> dict | None:
-    path = STROKE_DATA_DIR / f"{character}.json"
-    if not path.exists():
+    if len(character) != 1 or character in '/\\:' or ord(character) < 32:
         return None
+    path = STROKE_DATA_DIR / f"{character}.json"
     try:
         with path.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
-    if not data.get("strokes"):
+    if not isinstance(data, dict):
+        return None
+    strokes = data.get("strokes")
+    if not isinstance(strokes, list) or not strokes or not all(
+        isinstance(stroke, str) and stroke.strip() for stroke in strokes
+    ):
+        return None
+    medians = data.get("medians", [])
+    if not isinstance(medians, list) or (medians and len(medians) != len(strokes)):
+        return None
+    try:
+        if any(
+            not isinstance(stroke, list)
+            or not stroke
+            or any(
+                not isinstance(point, list)
+                or len(point) != 2
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    for value in point
+                )
+                for point in stroke
+            )
+            for stroke in medians
+        ):
+            return None
+    except OverflowError:
         return None
     return data
 

@@ -83,7 +83,13 @@ class StudyUiTests(unittest.TestCase):
             self.assertEqual(repository.get_cards()[0].translation, translation)
             page.shutdown()
 
-    def test_dictionary_word_becomes_one_two_sided_card(self):
+    @patch.object(desktop, "get_examples", return_value=[{
+        "chinese": "这是学校。", "pinyin": "zhè shì xué xiào", "translation": "это школа",
+    }])
+    @patch.object(desktop, "search_entries", return_value=[{
+        "hanzi": "学校", "pinyin": "xué xiào", "translation": "школа",
+    }])
+    def test_dictionary_word_becomes_one_two_sided_card(self, _search, _examples):
         with tempfile.TemporaryDirectory() as folder:
             repository = StudyRepository(Path(folder) / "study.db")
             window = desktop.HanziLabWindow(repository)
@@ -183,8 +189,33 @@ class StudyUiTests(unittest.TestCase):
                 ),
                 patch.object(desktop.QMessageBox, "information"),
             ):
-                window.copybook_button.click()
+                window.copybook_kaiti_action.trigger()
 
+            self.assertTrue(output.exists())
+            self.assertGreater(output.stat().st_size, 10_000)
+            window.close()
+
+    def test_dictionary_copybook_menu_offers_xingshu(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repository = StudyRepository(Path(folder) / "study.db")
+            window = desktop.HanziLabWindow(repository)
+            window.current_result = {"hanzi": "学习"}
+            output = Path(folder) / "学习_行书.pdf"
+
+            with (
+                patch.object(
+                    desktop.QFileDialog,
+                    "getSaveFileName",
+                    return_value=(str(output), "PDF (*.pdf)"),
+                ),
+                patch.object(desktop.QMessageBox, "information"),
+            ):
+                window.copybook_xingshu_action.trigger()
+
+            self.assertEqual(
+                [action.text() for action in window.copybook_menu.actions()],
+                ["楷书 · стандартные прописи", "行书 · прописи XingShu"],
+            )
             self.assertTrue(output.exists())
             self.assertGreater(output.stat().st_size, 10_000)
             window.close()
