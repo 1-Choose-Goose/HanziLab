@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QImage
 from PySide6.QtWidgets import QApplication, QLabel
 
@@ -42,6 +43,29 @@ class AppIconTests(unittest.TestCase):
             self.assertIsNotNone(seal)
             self.assertEqual(seal.text(), "汉")
             self.assertEqual(seal.font().family(), desktop.XINGSHU_FAMILY)
+            window.close()
+
+    def test_about_page_lists_developer_and_clickable_contacts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repository = StudyRepository(Path(folder) / "study.db")
+            window = desktop.HanziLabWindow(repository)
+            window.about_button.click()
+
+            self.assertEqual(window.page_stack.currentIndex(), 3)
+            developer = window.findChild(QLabel, "aboutDeveloper")
+            contacts = window.findChild(QLabel, "aboutContacts")
+            self.assertEqual(developer.text(), "Разработчик: Choose_Goose")
+            self.assertTrue(contacts.openExternalLinks())
+            self.assertEqual(
+                contacts.textInteractionFlags(),
+                Qt.TextInteractionFlag.TextBrowserInteraction,
+            )
+            for contact in (
+                "https://vk.ru/kamereka",
+                "https://t.me/choose_o_goose",
+                "https://t.me/yi_bi_yi_hua",
+            ):
+                self.assertIn(contact, contacts.text())
             window.close()
 
     def test_build_configuration_embeds_and_bundles_the_icon(self):

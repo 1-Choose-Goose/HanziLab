@@ -4,9 +4,6 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(SPECPATH)
-DICTIONARY_PATH = PROJECT_ROOT / "data" / "hanzi.db"
-if not DICTIONARY_PATH.exists():
-    DICTIONARY_PATH = PROJECT_ROOT / "data" / "hanzi-placeholder.db"
 
 a = Analysis(
     [str(PROJECT_ROOT / "desktop.py")],
@@ -17,7 +14,6 @@ a = Analysis(
         (str(PROJECT_ROOT / "assets" / "icons"), "assets/icons"),
         (str(PROJECT_ROOT / "assets" / "strokes"), "assets/strokes"),
         (str(PROJECT_ROOT / "assets" / "cursive"), "assets/cursive"),
-        (str(DICTIONARY_PATH), "data"),
     ],
     hiddenimports=[],
     hookspath=[],
@@ -27,6 +23,22 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+# Qt for Windows uses the ICU compatibility DLLs supplied by Windows itself.
+# A third-party icuuc.dll can leak in from PATH during the build and shadow the
+# system DLL, causing PySide6.QtCore to fail with "procedure not found".
+a.binaries = [
+    entry
+    for entry in a.binaries
+    if not (
+        Path(entry[0]).name.lower() == "icuuc.dll"
+        or (
+            Path(entry[0]).name.lower().startswith("icudt")
+            and Path(entry[0]).name.lower().endswith(".dll")
+        )
+    )
+]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

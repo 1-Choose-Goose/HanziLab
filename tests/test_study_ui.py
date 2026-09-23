@@ -37,6 +37,36 @@ class StudyUiTests(unittest.TestCase):
         self.assertEqual(desktop.readable_pinyin("聊天儿", "liáotiānr"), "liáo tiānr")
         self.assertEqual(desktop.readable_pinyin("系上", "jìshang"), "jì shang")
 
+    def test_all_cards_button_opens_complete_card_list(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repository = StudyRepository(Path(folder) / "study.db")
+            repository.add_card("你好", "nǐ hǎo", "здравствуйте")
+            repository.add_card("学习", "xué xí", "учиться")
+            page = study_view.StudyPage(
+                repository,
+                lambda *_arguments: [],
+                "HanziLab KaiTi CJK",
+                "Times New Roman",
+                lambda _hanzi, pinyin: pinyin,
+            )
+
+            self.assertEqual(page.card_list_button.text(), "Все карточки")
+            with patch.object(study_view.CardListDialog, "exec", return_value=0) as show:
+                page.card_list_button.click()
+            show.assert_called_once_with()
+
+            dialog = study_view.CardListDialog(
+                repository,
+                "HanziLab KaiTi CJK",
+                "Times New Roman",
+            )
+            self.assertEqual(dialog.table.rowCount(), 2)
+            self.assertEqual(dialog.table.columnCount(), 3)
+            self.assertEqual(dialog.table.item(0, 0).text(), "你好")
+            self.assertEqual(dialog.table.item(1, 2).text(), "учиться")
+            dialog.close()
+            page.shutdown()
+
     def test_russian_card_side_hides_pinyin_without_changing_stored_translation(self):
         translation = (
             "вещь, предмет [народное]\n"

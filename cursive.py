@@ -12,6 +12,19 @@ from pathlib import Path
 from text_formatting import is_cjk
 
 ASSET_DIR = Path(__file__).resolve().parent / "assets" / "cursive"
+STROKE_DATA_DIR = Path(__file__).resolve().parent / "assets" / "strokes"
+
+# Variant forms which occur in the cursive catalogue but do not have their own
+# Hanzi Writer record.  Keeping their counts here lets the whole catalogue take
+# part in stroke-count sorting.
+STROKE_COUNT_FALLBACKS = {
+    "𠂇": 2,
+    "𠂉": 2,
+    "牜": 4,
+    "巟": 6,
+    "彫": 11,
+    "滆": 13,
+}
 
 
 @dataclass(frozen=True)
@@ -36,6 +49,21 @@ def load_catalog() -> tuple[CursiveSample, ...]:
     return tuple(CursiveSample(**sample) for sample in data["samples"])
 
 
+@cache
+def stroke_count(character: str) -> int:
+    """Return the number of strokes, placing unknown characters last."""
+    try:
+        data = json.loads(
+            (STROKE_DATA_DIR / f"{character}.json").read_text(encoding="utf-8")
+        )
+        strokes = data.get("strokes")
+        if isinstance(strokes, list) and strokes:
+            return len(strokes)
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+        pass
+    return STROKE_COUNT_FALLBACKS.get(character, 10_000)
+
+
 def group_samples(
     query: str = "", page: int | None = None
 ) -> dict[str, tuple[CursiveSample, ...]]:
@@ -46,7 +74,10 @@ def group_samples(
         if query.strip() and sample.character not in query.strip():
             continue
         groups.setdefault(sample.character, []).append(sample)
-    return {character: tuple(samples) for character, samples in groups.items()}
+    return {
+        character: tuple(groups[character])
+        for character in sorted(groups, key=stroke_count)
+    }
 
 
 @cache

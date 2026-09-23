@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 from collections.abc import Iterable
 from contextlib import closing
 from datetime import datetime, timezone
@@ -17,7 +18,8 @@ from scheduler import (
 from text_formatting import normalize_display_text
 
 ROOT = Path(__file__).resolve().parent
-STUDY_DB_PATH = ROOT / "data" / "study.db"
+APP_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ROOT
+STUDY_DB_PATH = APP_ROOT / "data" / "study.db"
 SCHEMA_VERSION = 7
 DEFAULT_DAILY_REVIEW_LIMIT = 30
 DAILY_SESSION_LIMIT_PREFIX = "daily_session_limit:"

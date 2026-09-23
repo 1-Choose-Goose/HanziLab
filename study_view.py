@@ -7,12 +7,14 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QAbstractSpinBox,
     QApplication,
     QDialog,
     QFileDialog,
     QFormLayout,
     QFrame,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -22,6 +24,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -418,6 +422,68 @@ class ExampleLoadTask(QRunnable):
         self.signals.finished.emit(self.generation, self.key, examples, error)
 
 
+class CardListDialog(QDialog):
+    def __init__(
+        self,
+        repository: StudyRepository,
+        chinese_font_family: str,
+        russian_font_family: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("cardListDialog")
+        self.setWindowTitle("Все карточки")
+        self.resize(820, 560)
+        self.setMinimumSize(620, 420)
+
+        cards = repository.get_cards()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(16)
+
+        heading = QLabel("Все карточки")
+        heading.setObjectName("cardListTitle")
+        count = QLabel(f"Сохранено карточек: {len(cards)}")
+        count.setObjectName("cardListCount")
+        layout.addWidget(heading)
+        layout.addWidget(count)
+
+        self.table = QTableWidget(len(cards), 3)
+        self.table.setObjectName("cardListTable")
+        self.table.setHorizontalHeaderLabels(("Слово", "Пиньинь", "Перевод"))
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.verticalHeader().hide()
+        self.table.verticalHeader().setDefaultSectionSize(48)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+
+        for row, card in enumerate(cards):
+            values = (card.hanzi, card.pinyin, card.translation)
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                item.setFont(
+                    QFont(chinese_font_family, 16)
+                    if column == 0
+                    else QFont(russian_font_family, 11)
+                )
+                item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                )
+                self.table.setItem(row, column, item)
+        layout.addWidget(self.table, 1)
+
+        close_button = QPushButton("Закрыть")
+        close_button.setObjectName("cardListCloseButton")
+        close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button, alignment=Qt.AlignmentFlag.AlignRight)
+
+
 class StudyPage(QWidget):
     card_count_changed = Signal(int)
     cards_changed = Signal()
@@ -476,14 +542,15 @@ class StudyPage(QWidget):
         self.import_anki_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.import_anki_button.setToolTip("Импортировать текстовый экспорт Anki")
         self.import_anki_button.clicked.connect(self.import_anki_cards)
+        self.card_list_button = QPushButton("Все карточки")
+        self.card_list_button.setObjectName("cardListButton")
+        self.card_list_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.card_list_button.setToolTip("Показать список всех сохранённых карточек")
+        self.card_list_button.clicked.connect(self.show_card_list)
         self.manual_card_button = QPushButton("Новая карточка")
         self.manual_card_button.setObjectName("manualCardButton")
         self.manual_card_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.manual_card_button.clicked.connect(self.add_manual_card)
-        header.addWidget(self.manual_card_button)
-        header.addSpacing(8)
-        header.addWidget(self.import_anki_button)
-        header.addSpacing(12)
 
         limit_label = QLabel("Карточек в день")
         limit_label.setObjectName("studySettingLabel")
@@ -514,6 +581,14 @@ class StudyPage(QWidget):
         header.addWidget(limit_label)
         header.addWidget(limit_control)
         root.addLayout(header)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        actions.addWidget(self.manual_card_button)
+        actions.addWidget(self.card_list_button)
+        actions.addWidget(self.import_anki_button)
+        actions.addStretch()
+        root.addLayout(actions)
 
         progress_line = QHBoxLayout()
         self.progress_label = QLabel("0 / 30")
@@ -866,6 +941,15 @@ class StudyPage(QWidget):
         )
         dialog.card_added.connect(self.manual_card_was_added)
         dialog.priority_raised.connect(self.manual_priority_was_raised)
+        dialog.exec()
+
+    def show_card_list(self) -> None:
+        dialog = CardListDialog(
+            self.repository,
+            self.chinese_font_family,
+            self.russian_font_family,
+            self,
+        )
         dialog.exec()
 
     def manual_card_was_added(self, _hanzi: str) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import sys
 import threading
 import unicodedata
 from contextlib import closing
@@ -18,9 +19,14 @@ from scripts.text_normalization import (
 )
 
 ROOT = Path(__file__).resolve().parent
-FULL_DB_PATH = ROOT / "data" / "hanzi.db"
+APP_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ROOT
+FULL_DB_PATH = APP_ROOT / "data" / "hanzi.db"
 PLACEHOLDER_DB_PATH = ROOT / "data" / "hanzi-placeholder.db"
-DB_PATH = FULL_DB_PATH if FULL_DB_PATH.exists() else PLACEHOLDER_DB_PATH
+DB_PATH = (
+    FULL_DB_PATH
+    if FULL_DB_PATH.exists() or getattr(sys, "frozen", False)
+    else PLACEHOLDER_DB_PATH
+)
 ORIGINAL_VOCABULARY_SIZE = 1204
 
 CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")

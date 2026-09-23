@@ -19,6 +19,7 @@ from cursive import (
     group_samples,
     load_catalog,
     search_cursive,
+    stroke_count,
 )
 from cursive_copybook import generate_cursive_copybook
 from cursive_view import CursivePage
@@ -48,6 +49,12 @@ class CursiveTests(unittest.TestCase):
         self.assertGreater(len(group_samples()["学"]), 1)
         self.assertEqual(set(group_samples("学习学")), {"学", "习"})
         self.assertEqual(group_samples("abc"), {})
+
+    def test_catalogue_is_sorted_by_stroke_count(self):
+        characters = list(group_samples())
+        counts = [stroke_count(character) for character in characters]
+        self.assertEqual(counts, sorted(counts))
+        self.assertLess(max(counts), 10_000)
 
     def test_search_selection_and_variants_keep_correct_handwriting(self):
         page = CursivePage()

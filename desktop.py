@@ -72,6 +72,10 @@ KAITI_FAMILY = "KaiTi"
 XINGSHU_FAMILY = "QXyingbixing"
 INPUT_KAITI_FAMILY = "HanziLab KaiTi CJK"
 RUSSIAN_FONT_FAMILY = "Times New Roman"
+DEVELOPER_NAME = "Choose_Goose"
+VK_URL = "https://vk.ru/kamereka"
+TELEGRAM_URL = "https://t.me/choose_o_goose"
+TELEGRAM_CHANNEL_URL = "https://t.me/yi_bi_yi_hua"
 
 
 class BackgroundTaskSignals(QObject):
@@ -321,6 +325,7 @@ class HanziLabWindow(QMainWindow):
         self.page_stack.addWidget(self.create_cards_page())
         self.cursive_page = CursivePage(self)
         self.page_stack.addWidget(self.cursive_page)
+        self.page_stack.addWidget(self.create_about_page())
         shell.addWidget(self.page_stack, 1)
 
         self.search_timer = QTimer(self)
@@ -379,7 +384,7 @@ class HanziLabWindow(QMainWindow):
         layout.addLayout(brand)
         layout.addSpacing(36)
 
-        section = QLabel("ОБУЧЕНИЕ")
+        section = QLabel("РАЗДЕЛЫ")
         section.setObjectName("sidebarSection")
         layout.addWidget(section)
 
@@ -401,6 +406,12 @@ class HanziLabWindow(QMainWindow):
         self.cursive_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.cursive_button.clicked.connect(lambda: self.show_page(2))
         layout.addWidget(self.cursive_button)
+
+        self.about_button = QPushButton("О программе")
+        self.about_button.setObjectName("navButton")
+        self.about_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.about_button.clicked.connect(lambda: self.show_page(3))
+        layout.addWidget(self.about_button)
 
         reviews = QPushButton("Повторение")
         reviews.setObjectName("navDisabled")
@@ -433,7 +444,13 @@ class HanziLabWindow(QMainWindow):
         self.dictionary_button.setObjectName("navActive" if index == 0 else "navButton")
         self.cards_button.setObjectName("navActive" if index == 1 else "navButton")
         self.cursive_button.setObjectName("navActive" if index == 2 else "navButton")
-        for button in (self.dictionary_button, self.cards_button, self.cursive_button):
+        self.about_button.setObjectName("navActive" if index == 3 else "navButton")
+        for button in (
+            self.dictionary_button,
+            self.cards_button,
+            self.cursive_button,
+            self.about_button,
+        ):
             button.style().unpolish(button)
             button.style().polish(button)
         if index == 1:
@@ -455,6 +472,50 @@ class HanziLabWindow(QMainWindow):
         self.study_page.card_count_changed.connect(self.update_cards_button)
         self.study_page.cards_changed.connect(self.refresh_current_card_button)
         return self.study_page
+
+    def create_about_page(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("aboutPage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(38, 30, 38, 32)
+        layout.setSpacing(12)
+
+        title = QLabel("О программе")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+
+        subtitle = QLabel(
+            "HanziLab — приложение для изучения китайских иероглифов и слов."
+        )
+        subtitle.setObjectName("pageSubtitle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+        layout.addSpacing(18)
+
+        card = QFrame()
+        card.setObjectName("aboutCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(24, 22, 24, 22)
+        card_layout.setSpacing(12)
+
+        developer = QLabel(f"Разработчик: {DEVELOPER_NAME}")
+        developer.setObjectName("aboutDeveloper")
+        card_layout.addWidget(developer)
+
+        contacts = QLabel(
+            f'<a href="{VK_URL}">VK</a><br>'
+            f'<a href="{TELEGRAM_URL}">Telegram: @choose_o_goose</a><br>'
+            f'<a href="{TELEGRAM_CHANNEL_URL}">Telegram-канал «一笔一画»</a>'
+        )
+        contacts.setObjectName("aboutContacts")
+        contacts.setTextFormat(Qt.TextFormat.RichText)
+        contacts.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        contacts.setOpenExternalLinks(True)
+        card_layout.addWidget(contacts)
+
+        layout.addWidget(card)
+        layout.addStretch()
+        return page
 
     def create_content(self) -> QWidget:
         content = QWidget()
@@ -1046,6 +1107,10 @@ QPushButton#navActive:hover { background: #2C4047; }
 QPushButton#navButton { background: transparent; color: #B3C0C5; }
 QPushButton#navButton:hover { background: #1A2A30; color: #FFFFFF; }
 QPushButton#navDisabled { background: transparent; color: #71838B; }
+QFrame#aboutCard { background: #FFFFFF; border: 1px solid #DFE4E6; border-radius: 12px; }
+QLabel#aboutDeveloper { color: #243139; font-size: 16px; font-weight: 600; }
+QLabel#aboutContacts { color: #526168; font-size: 14px; line-height: 1.6; }
+QLabel#aboutContacts a { color: #D45240; text-decoration: none; }
 QLabel#localStatus { color: #83949B; background: #17262C; border-radius: 10px; padding: 13px; font-size: 12px; line-height: 1.5; }
 QComboBox#fontSelector { background: #17262C; color: #D8E1E4; border: 1px solid #2A3C43; border-radius: 9px; padding: 9px 11px; font-size: 12px; }
 QComboBox#fontSelector:hover { border-color: #496069; }
@@ -1144,12 +1209,23 @@ QPushButton#strokeButton:disabled { color: #B7C0C4; background: #F8F9FA; }
 QLabel#strokeStatus { color: #75838A; font-size: 12px; }
 QWidget#studyPage { background: #F4F6F8; }
 QLabel#studySettingLabel, QLabel#studyQueueInfo { color: #6E7C83; font-size: 12px; }
-QPushButton#importCardsButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 10px 14px; font-size: 12px; font-weight: 600; }
-QPushButton#importCardsButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
-QPushButton#importCardsButton:pressed { background: #FADFD9; color: #B44334; }
+QPushButton#importCardsButton, QPushButton#cardListButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 10px 14px; font-size: 12px; font-weight: 600; }
+QPushButton#importCardsButton:hover, QPushButton#cardListButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QPushButton#importCardsButton:pressed, QPushButton#cardListButton:pressed { background: #FADFD9; color: #B44334; }
 QPushButton#manualCardButton { background: #E05945; color: #FFFFFF; border: none; border-radius: 9px; padding: 11px 15px; font-size: 12px; font-weight: 700; }
 QPushButton#manualCardButton:hover { background: #C94D3C; }
 QPushButton#manualCardButton:pressed { background: #B44334; }
+QDialog#cardListDialog { background: #F7F9FA; }
+QLabel#cardListTitle { color: #182026; font-size: 20px; font-weight: 700; }
+QLabel#cardListCount { color: #6E7C83; font-size: 12px; }
+QTableWidget#cardListTable { background: #FFFFFF; color: #243139; gridline-color: #E1E6E8; border: 1px solid #DFE4E6; border-radius: 10px; outline: none; selection-background-color: #FFF1ED; selection-color: #C94D3C; }
+QTableWidget#cardListTable::item { padding: 7px; }
+QTableWidget#cardListTable::item:hover { background: #F8FAFA; }
+QTableWidget#cardListTable::item:selected { background: #FFF1ED; color: #C94D3C; }
+QHeaderView::section { background: #EEF2F3; color: #526168; border: none; border-bottom: 1px solid #D7DEE1; padding: 9px; font-size: 12px; font-weight: 700; }
+QPushButton#cardListCloseButton { background: #E05945; color: #FFFFFF; border: none; border-radius: 9px; padding: 10px 20px; min-width: 90px; font-weight: 700; }
+QPushButton#cardListCloseButton:hover { background: #C94D3C; }
+QPushButton#cardListCloseButton:pressed { background: #B44334; }
 QDialog#manualCardDialog { background: #F7F9FA; }
 QLabel#manualCardTitle { color: #182026; font-size: 20px; font-weight: 700; }
 QLabel#manualCardSubtitle { color: #6E7C83; font-size: 12px; }
@@ -1208,12 +1284,15 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 
 
 def main() -> None:
-    if not DB_PATH.exists():
+    smoke_test = "--smoke-test" in sys.argv
+    if not smoke_test and not DB_PATH.exists():
         raise SystemExit("В комплекте приложения не найдена база HanziLab")
     app = QApplication(sys.argv)
     app.setApplicationName("HanziLab")
     app.setOrganizationName("HanziLab")
     app.setWindowIcon(QIcon(str(APP_ICON_PNG)))
+    if smoke_test:
+        return
     if sys.platform == "win32":
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
