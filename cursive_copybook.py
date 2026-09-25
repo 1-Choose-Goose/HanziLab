@@ -67,7 +67,8 @@ def paint_copybook(painter: QPainter, sample: CursiveSample, image: QImage) -> N
                 )
             painter.setPen(QPen(QColor("#D68B79"), 0.45))
             painter.drawRect(rect)
-            guide = QPen(QColor("#DABDB4"), 0.35, Qt.PenStyle.DashLine)
+            # Inner guides should remain visible without competing with handwriting.
+            guide = QPen(QColor("#F0E6E3"), 0.25, Qt.PenStyle.DashLine)
             painter.setPen(guide)
             painter.drawLine(
                 rect.center().x(), rect.top(), rect.center().x(), rect.bottom()

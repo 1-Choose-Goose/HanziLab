@@ -80,13 +80,13 @@ def _delimiter_and_data(content: str) -> tuple[str, str, set[int]]:
                 requested = value.strip().lower()
                 delimiter = SEPARATORS.get(requested, value.strip())
                 if len(delimiter) != 1 or delimiter in {"\r", "\n", "\x00"}:
-                    raise ValueError("В экспорте Anki указан неверный разделитель полей")
+                    raise ValueError("В экспорте указан неверный разделитель полей")
             elif separator and key.lower() in {
                 "#notetype column", "#deck column", "#tags column", "#guid column"
             }:
                 column = int(value.strip())
                 if column < 1:
-                    raise ValueError("Номер служебного столбца Anki должен быть положительным")
+                    raise ValueError("Номер служебного столбца должен быть положительным")
                 metadata_columns.add(column - 1)
             continue
         reading_directives = False
@@ -115,7 +115,7 @@ def parse_anki_export(path: str | Path) -> AnkiImportResult:
         hanzi = clean_anki_field(fields[0])
         pinyin = clean_anki_field(fields[1]) if len(fields) > 1 else ""
         translation = clean_anki_field(fields[2]) if len(fields) > 2 else ""
-        # Only the Chinese headword is used for lookup. Anki's pinyin,
+        # Only the Chinese headword is used for lookup. Exported pinyin,
         # translation, tags and media never overwrite HanziLab dictionary data.
         if not hanzi or not CJK_RE.search(hanzi):
             invalid_rows += 1

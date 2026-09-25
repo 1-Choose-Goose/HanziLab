@@ -9,11 +9,11 @@ import unittest
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel, QScrollArea, QSpinBox
 
 import desktop
 import study_view
@@ -61,11 +61,152 @@ class StudyUiTests(unittest.TestCase):
                 "Times New Roman",
             )
             self.assertEqual(dialog.table.rowCount(), 2)
-            self.assertEqual(dialog.table.columnCount(), 3)
+            self.assertEqual(dialog.table.columnCount(), 4)
             self.assertEqual(dialog.table.item(0, 0).text(), "你好")
             self.assertEqual(dialog.table.item(1, 2).text(), "учиться")
+            self.assertEqual(dialog.table.item(0, 3).text(), "Обычная")
             dialog.close()
             page.shutdown()
+
+    def test_export_anki_button_writes_all_cards(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repository = StudyRepository(Path(folder) / "study.db")
+            repository.add_card("你好", "nǐ hǎo", "здравствуйте")
+            repository.add_card("学习", "xué xí", "учиться")
+            page = study_view.StudyPage(
+                repository,
+                lambda *_arguments: [],
+                "HanziLab KaiTi CJK",
+                "Times New Roman",
+                lambda _hanzi, pinyin: pinyin,
+            )
+            self.assertEqual(
+                page.export_anki_button.sizeHint().height(),
+                page.import_anki_button.sizeHint().height(),
+            )
+            output_without_suffix = Path(folder) / "anki-cards"
+
+            with (
+                patch.object(
+                    study_view.QFileDialog,
+                    "getSaveFileName",
+                    return_value=(str(output_without_suffix), ""),
+                ),
+                patch.object(study_view.QMessageBox, "information") as message,
+            ):
+                page.export_anki_button.click()
+
+            output = output_without_suffix.with_suffix(".apkg")
+            self.assertTrue(output.exists())
+            self.assertEqual(output.read_bytes()[:2], b"PK")
+            self.assertIn("Экспортировано слов: 2", message.call_args.args[2])
+            page.shutdown()
+
+    def test_suspended_difficult_card_can_be_resumed_from_card_list(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repository = StudyRepository(Path(folder) / "study.db")
+            repository.add_card("难", "nán", "трудный")
+            with closing(repository.connect()) as connection, connection:
+                connection.execute(
+                    "UPDATE cards SET is_leech=1, is_suspended=1 WHERE id=1"
+                )
+            dialog = study_view.CardListDialog(
+                repository, "HanziLab KaiTi CJK", "Times New Roman"
+            )
+            dialog.table.selectRow(0)
+            self.app.processEvents()
+            self.assertTrue(dialog.resume_button.isEnabled())
+            dialog.resume_button.click()
+            self.assertFalse(repository.get_card(1).is_suspended)
+            self.assertEqual(dialog.table.item(0, 3).text(), "Трудная")
+            dialog.close()
+
+    def test_fsrs_settings_are_editable_and_persisted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repository = StudyRepository(Path(folder) / "study.db")
+            dialog = study_view.SpacedRepetitionSettingsDialog(repository)
+            self.assertEqual(dialog.retention.value(), 90)
+            self.assertEqual(dialog.learning_steps.text(), "2 минуты; 10 минут")
+            self.assertEqual(len(dialog.parsed_parameters()), 21)
+            self.assertFalse(dialog.parameters_panel.isVisible())
+            self.assertEqual(
+                dialog.easy_day_controls[0].view().objectName(),
+                "schedulerComboPopup",
+            )
+            self.assertTrue(
+                all(
+                    isinstance(control, study_view.CenteredNoWheelComboBox)
+                    for control in dialog.easy_day_controls
+                )
+            )
+            selected_easy_day_value = dialog.easy_day_controls[0].currentData()
+            wheel_event = Mock()
+            dialog.easy_day_controls[0].wheelEvent(wheel_event)
+            wheel_event.ignore.assert_called_once_with()
+            self.assertEqual(
+                dialog.easy_day_controls[0].currentData(),
+                selected_easy_day_value,
+            )
+            daily_limit = dialog.daily_limit.value()
+            spin_wheel_event = Mock()
+            dialog.daily_limit.wheelEvent(spin_wheel_event)
+            spin_wheel_event.ignore.assert_called_once_with()
+            self.assertEqual(dialog.daily_limit.value(), daily_limit)
+            self.assertTrue(dialog.fuzzing.property("schedulerToggle"))
+            self.assertEqual(dialog.fuzzing.text(), "Включено")
+            dialog.fuzzing.setChecked(False)
+            self.assertEqual(dialog.fuzzing.text(), "Выключено")
+            dialog.fuzzing.setChecked(True)
+
+            dialog.resize(700, 580)
+            dialog.show()
+            self.app.processEvents()
+            scroll = dialog.findChild(QScrollArea, "schedulerSettingsScroll")
+            content = scroll.widget()
+            self.assertEqual(content.width(), scroll.viewport().width())
+            for control in dialog.easy_day_controls:
+                right_edge = control.mapTo(content, control.rect().topRight()).x()
+                self.assertLess(right_edge, content.width())
+            first_row_left = dialog.easy_day_controls[0].mapTo(content, dialog.easy_day_controls[0].rect().topLeft()).x()
+            first_row_right = dialog.easy_day_controls[3].mapTo(content, dialog.easy_day_controls[3].rect().topRight()).x()
+            second_row_left = dialog.easy_day_controls[4].mapTo(content, dialog.easy_day_controls[4].rect().topLeft()).x()
+            second_row_right = dialog.easy_day_controls[6].mapTo(content, dialog.easy_day_controls[6].rect().topRight()).x()
+            self.assertAlmostEqual(
+                first_row_left + first_row_right,
+                second_row_left + second_row_right,
+                delta=2,
+            )
+
+            dialog.retention.setValue(95)
+            dialog.daily_limit.setValue(40)
+            dialog.new_cards_limit.setValue(7)
+            dialog.learning_steps.setText("1 минута; 15 минут")
+            dialog.relearning_steps.setText("")
+            dialog.new_card_order.setCurrentIndex(
+                dialog.new_card_order.findData("added")
+            )
+            dialog.new_review_order.setCurrentIndex(
+                dialog.new_review_order.findData("reviews_first")
+            )
+            dialog.review_order.setCurrentIndex(
+                dialog.review_order.findData("retrievability")
+            )
+            dialog.easy_day_controls[5].setCurrentIndex(
+                dialog.easy_day_controls[5].findData(0.1)
+            )
+            dialog.reschedule.setChecked(False)
+            dialog.save()
+
+            stored = repository.get_scheduler_config()
+            self.assertEqual(stored.desired_retention, 0.95)
+            self.assertEqual(stored.learning_steps_seconds, (60, 900))
+            self.assertEqual(stored.relearning_steps_seconds, ())
+            self.assertEqual(stored.new_card_order, "added")
+            self.assertEqual(stored.new_review_order, "reviews_first")
+            self.assertEqual(stored.review_order, "retrievability")
+            self.assertEqual(stored.easy_days_percentages[5], 0.1)
+            self.assertEqual(repository.get_daily_limit(), 40)
+            self.assertEqual(repository.get_new_cards_limit(), 7)
 
     def test_russian_card_side_hides_pinyin_without_changing_stored_translation(self):
         translation = (
@@ -249,6 +390,65 @@ class StudyUiTests(unittest.TestCase):
             self.assertTrue(output.exists())
             self.assertGreater(output.stat().st_size, 10_000)
             window.close()
+
+    def test_copybook_collection_searches_and_builds_selected_words(self):
+        dialog = desktop.CopybookCollectionDialog(desktop.KAITI_FAMILY)
+        rows = [{
+            "hanzi": "学习",
+            "pinyin": "xué xí",
+            "translation": "учиться",
+        }]
+        dialog.search_timer.setInterval(0)
+        with patch.object(desktop, "search_entries", return_value=rows) as search:
+            dialog.search.setText("учиться")
+            QTest.qWait(10)
+            self.app.processEvents()
+        search.assert_called_once_with("учиться", 40)
+        self.assertEqual(dialog.results.count(), 1)
+        result_row = dialog.results.itemWidget(dialog.results.item(0))
+        self.assertIsInstance(result_row, desktop.ResultRow)
+        self.assertEqual(
+            result_row.findChild(QLabel, "resultHanzi").font().family(),
+            desktop.KAITI_FAMILY,
+        )
+        self.assertEqual(
+            result_row.findChild(QLabel, "resultTranslation").font().family(),
+            desktop.RUSSIAN_FONT_FAMILY,
+        )
+        dialog.add_selected_result()
+        self.assertEqual(dialog.selected_hanzi(), ["学习"])
+        self.assertTrue(dialog.generate_button.isEnabled())
+        dialog.row_spacing.setValue(4)
+        wheel_event = Mock()
+        dialog.row_spacing.wheelEvent(wheel_event)
+        wheel_event.ignore.assert_called_once_with()
+        self.assertEqual(dialog.row_spacing.value(), 4)
+        style_wheel_event = Mock()
+        dialog.style.wheelEvent(style_wheel_event)
+        style_wheel_event.ignore.assert_called_once_with()
+
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            patch.object(
+                desktop.QFileDialog,
+                "getSaveFileName",
+                return_value=(str(Path(folder) / "collection.pdf"), "PDF (*.pdf)"),
+            ),
+            patch.object(desktop, "generate_assembled_copybook") as generate,
+            patch.object(desktop.QMessageBox, "information"),
+        ):
+            generate.return_value = Mock(
+                path=Path(folder) / "collection.pdf",
+                missing_characters=(),
+            )
+            dialog.create_pdf()
+            generate.assert_called_once_with(
+                ["学习"],
+                str(Path(folder) / "collection.pdf"),
+                row_spacing=4,
+                style=desktop.CopybookStyle.KAITI,
+            )
+        dialog.close()
 
     def test_dictionary_card_can_be_removed_with_confirmation(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -635,7 +835,7 @@ class StudyUiTests(unittest.TestCase):
             self.assertEqual(page.current_item.presentation_id, next_presentation)
             window.close()
 
-    def test_daily_limit_editor_temporarily_disables_card_shortcuts(self):
+    def test_daily_limit_editor_is_only_available_in_scheduler_settings(self):
         with tempfile.TemporaryDirectory() as folder:
             repository = StudyRepository(Path(folder) / "study.db")
             repository.add_card("你好", "nǐ hǎo", "здравствуйте")
@@ -644,18 +844,11 @@ class StudyUiTests(unittest.TestCase):
             window.show()
             self.app.processEvents()
             page = window.study_page
-            page.show_answer()
+            self.assertIsNone(page.findChild(QSpinBox, "dailyLimit"))
 
-            page.daily_limit.setFocus()
-            self.app.processEvents()
-            self.assertTrue(all(not shortcut.isEnabled() for shortcut in page.rating_shortcuts.values()))
-            QTest.keyClick(page.daily_limit, Qt.Key.Key_1)
-            self.app.processEvents()
-            self.assertEqual(repository.review_event_count(), 0)
-
-            page.setFocus()
-            self.app.processEvents()
-            self.assertTrue(all(shortcut.isEnabled() for shortcut in page.rating_shortcuts.values()))
+            dialog = study_view.SpacedRepetitionSettingsDialog(repository)
+            self.assertIsNotNone(dialog.findChild(QSpinBox, "settingsDailyLimit"))
+            dialog.close()
             window.close()
 
     def test_card_examples_are_loaded_without_blocking_the_gui(self):

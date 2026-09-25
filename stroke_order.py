@@ -4,10 +4,18 @@ import html
 import json
 import math
 from functools import lru_cache
+from itertools import pairwise
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import QByteArray, QPointF, QRectF, Qt, QTimer
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QPainter,
+    QPainterPath,
+    QPainterPathStroker,
+    QPen,
+)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -72,12 +80,14 @@ class StrokeCanvas(QWidget):
         self.character = ""
         self.data: dict | None = None
         self.current_stroke = 0
+        self.stroke_progress = 0.0
         self.setMinimumHeight(300)
 
     def set_character(self, character: str, data: dict) -> None:
         self.character = character
         self.data = data
         self.current_stroke = 0
+        self.stroke_progress = 0.0
         self.update()
 
     def set_current_stroke(self, index: int) -> None:
@@ -85,6 +95,28 @@ class StrokeCanvas(QWidget):
             return
         self.current_stroke = min(max(index, 0), len(self.data["strokes"]) - 1)
         self.update()
+
+    def set_stroke_progress(self, progress: float) -> None:
+        self.stroke_progress = min(max(progress, 0.0), 1.0)
+        self.update()
+
+    def reset_animation(self) -> None:
+        self.current_stroke = 0
+        self.stroke_progress = 0.0
+        self.update()
+
+    def current_stroke_duration_ms(self) -> int:
+        if not self.data:
+            return 500
+        medians = self.data.get("medians", [])
+        if not (0 <= self.current_stroke < len(medians)):
+            return 500
+        points = medians[self.current_stroke]
+        length = sum(
+            math.hypot(x2 - x1, y2 - y1)
+            for (x1, y1), (x2, y2) in pairwise(points)
+        )
+        return round(max(480.0, min(1350.0, length * 1.45)))
 
     @staticmethod
     def stroke_svg(path: str, color: str) -> QByteArray:
@@ -95,6 +127,56 @@ class StrokeCanvas(QWidget):
             "</g></svg>"
         )
         return QByteArray(document.encode("utf-8"))
+
+    @staticmethod
+    def _canvas_point(point: list[float], target: QRectF) -> QPointF:
+        x, y = point
+        return QPointF(
+            target.left() + target.width() * x / 1024,
+            target.top() + target.height() * (900 - y) / 1024,
+        )
+
+    def _revealed_stroke_area(
+        self,
+        points: list[list[float]],
+        target: QRectF,
+        progress: float,
+    ) -> QPainterPath:
+        if not points or progress <= 0:
+            return QPainterPath()
+        mapped = [self._canvas_point(point, target) for point in points]
+        segment_lengths = [
+            math.hypot(second.x() - first.x(), second.y() - first.y())
+            for first, second in pairwise(mapped)
+        ]
+        remaining = sum(segment_lengths) * min(progress, 1.0)
+        center_line = QPainterPath(mapped[0])
+        for first, second, segment_length in zip(
+            mapped, mapped[1:], segment_lengths
+        ):
+            if segment_length <= 0:
+                continue
+            if remaining >= segment_length:
+                center_line.lineTo(second)
+                remaining -= segment_length
+                continue
+            fraction = remaining / segment_length
+            center_line.lineTo(
+                QPointF(
+                    first.x() + (second.x() - first.x()) * fraction,
+                    first.y() + (second.y() - first.y()) * fraction,
+                )
+            )
+            break
+        brush_width = max(16.0, target.width() * 0.11)
+        stroker = QPainterPathStroker()
+        stroker.setWidth(brush_width)
+        stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
+        stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        revealed = stroker.createStroke(center_line)
+        radius = brush_width / 2
+        revealed.addEllipse(mapped[0], radius, radius)
+        return revealed
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
@@ -118,13 +200,37 @@ class StrokeCanvas(QWidget):
         for index, path in enumerate(strokes):
             if index < self.current_stroke:
                 color = "#253239"
-            elif index == self.current_stroke:
-                color = "#E05945"
             else:
                 color = "#E5EAEC"
             QSvgRenderer(self.stroke_svg(path, color)).render(painter, target)
 
         medians = self.data.get("medians", [])
+        if 0 <= self.current_stroke < len(strokes):
+            current_path = strokes[self.current_stroke]
+            if self.current_stroke < len(medians) and medians[self.current_stroke]:
+                revealed = self._revealed_stroke_area(
+                    medians[self.current_stroke], target, self.stroke_progress
+                )
+                painter.save()
+                painter.setClipPath(revealed)
+                QSvgRenderer(self.stroke_svg(current_path, "#E05945")).render(
+                    painter, target
+                )
+                painter.restore()
+            elif self.stroke_progress > 0:
+                clip = QRectF(
+                    target.left(),
+                    target.top(),
+                    target.width() * self.stroke_progress,
+                    target.height(),
+                )
+                painter.save()
+                painter.setClipRect(clip)
+                QSvgRenderer(self.stroke_svg(current_path, "#E05945")).render(
+                    painter, target
+                )
+                painter.restore()
+
         for index, points in enumerate(medians):
             if not points or index > self.current_stroke:
                 continue
@@ -176,28 +282,14 @@ class StrokeOrderPanel(QFrame):
         self.canvas.setObjectName("strokeCanvas")
         layout.addWidget(self.canvas)
 
-        controls = QHBoxLayout()
-        self.previous_button = QPushButton("← Назад")
-        self.previous_button.setObjectName("strokeButton")
-        self.play_button = QPushButton("▶ Показать")
-        self.play_button.setObjectName("strokePlayButton")
-        self.next_button = QPushButton("Следующая →")
-        self.next_button.setObjectName("strokeButton")
         self.status = QLabel()
         self.status.setObjectName("strokeStatus")
-        self.previous_button.clicked.connect(self.previous_stroke)
-        self.next_button.clicked.connect(self.next_stroke)
-        self.play_button.clicked.connect(self.toggle_animation)
-        controls.addWidget(self.previous_button)
-        controls.addWidget(self.play_button)
-        controls.addWidget(self.next_button)
-        controls.addStretch()
-        controls.addWidget(self.status)
-        layout.addLayout(controls)
+        layout.addWidget(self.status, alignment=Qt.AlignmentFlag.AlignRight)
 
         self.timer = QTimer(self)
-        self.timer.setInterval(650)
+        self.timer.setInterval(16)
         self.timer.timeout.connect(self.animation_step)
+        self.loop_delay_remaining_ms = 0
         self.setVisible(False)
 
     def set_chinese_font(self, family: str) -> None:
@@ -207,7 +299,7 @@ class StrokeOrderPanel(QFrame):
 
     def set_word(self, word: str) -> None:
         self.timer.stop()
-        self.play_button.setText("▶ Показать")
+        self.loop_delay_remaining_ms = 0
         self.characters = []
         for character in word:
             if character not in self.characters and load_character_data(character):
@@ -237,51 +329,46 @@ class StrokeOrderPanel(QFrame):
         if not (0 <= index < len(self.characters)):
             return
         self.timer.stop()
-        self.play_button.setText("▶ Показать")
         character = self.characters[index]
         data = load_character_data(character)
         if data:
             self.canvas.set_character(character, data)
             self.update_status()
+            self.start_animation()
 
     def update_status(self) -> None:
         count = len(self.canvas.data["strokes"]) if self.canvas.data else 0
         current = self.canvas.current_stroke + 1 if count else 0
         self.status.setText(f"Черта {current} из {count}")
-        self.previous_button.setEnabled(current > 1)
-        self.next_button.setEnabled(current < count)
 
-    def previous_stroke(self) -> None:
-        self.timer.stop()
-        self.play_button.setText("▶ Показать")
-        self.canvas.set_current_stroke(self.canvas.current_stroke - 1)
-        self.update_status()
-
-    def next_stroke(self) -> None:
-        self.timer.stop()
-        self.play_button.setText("▶ Показать")
-        self.canvas.set_current_stroke(self.canvas.current_stroke + 1)
-        self.update_status()
-
-    def toggle_animation(self) -> None:
-        if self.timer.isActive():
-            self.timer.stop()
-            self.play_button.setText("▶ Продолжить")
+    def start_animation(self) -> None:
+        if not self.canvas.data:
             return
-        if self.play_button.text() != "▶ Продолжить":
-            self.canvas.set_current_stroke(0)
-            self.update_status()
-        self.play_button.setText("Ⅱ Пауза")
+        self.loop_delay_remaining_ms = 0
+        self.canvas.reset_animation()
+        self.update_status()
         self.timer.start()
 
     def animation_step(self) -> None:
         if not self.canvas.data:
             self.timer.stop()
             return
+        if self.loop_delay_remaining_ms > 0:
+            self.loop_delay_remaining_ms -= self.timer.interval()
+            if self.loop_delay_remaining_ms <= 0:
+                self.canvas.reset_animation()
+                self.update_status()
+            return
         last = len(self.canvas.data["strokes"]) - 1
+        duration = self.canvas.current_stroke_duration_ms()
+        progress = self.canvas.stroke_progress + self.timer.interval() / duration
+        if progress < 1.0:
+            self.canvas.set_stroke_progress(progress)
+            return
+        self.canvas.set_stroke_progress(1.0)
         if self.canvas.current_stroke >= last:
-            self.timer.stop()
-            self.play_button.setText("↻ Повторить")
+            self.loop_delay_remaining_ms = 750
             return
         self.canvas.set_current_stroke(self.canvas.current_stroke + 1)
+        self.canvas.set_stroke_progress(0.0)
         self.update_status()

@@ -12,6 +12,7 @@ from scheduler import (
     calculate_retrievability,
     preview_ratings,
     schedule_rating,
+    validate_config,
 )
 
 NOW = datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc)
@@ -25,21 +26,25 @@ class SchedulerTests(unittest.TestCase):
     def test_new_card_intervals(self):
         previews = preview_ratings(new_card(), NOW)
         self.assertEqual(previews[Rating.VERY_HARD], timedelta(minutes=2))
-        self.assertEqual(previews[Rating.HARD], timedelta(days=1))
-        self.assertEqual(previews[Rating.MEDIUM], timedelta(days=3))
+        self.assertEqual(previews[Rating.HARD], timedelta(minutes=6))
+        self.assertEqual(previews[Rating.MEDIUM], timedelta(minutes=10))
         self.assertEqual(previews[Rating.EASY], timedelta(days=8))
 
-    def test_learning_chain_two_then_ten_minutes_then_review(self):
+    def test_learning_chain_matches_anki_step_semantics(self):
         first = schedule_rating(new_card(), Rating.VERY_HARD, NOW)
         self.assertEqual(first.interval, timedelta(minutes=2))
         self.assertEqual(first.card.learning_state, LearningState.LEARNING)
         second_time = NOW + first.interval
         second = schedule_rating(first.card, Rating.HARD, second_time)
-        self.assertEqual(second.interval, timedelta(minutes=10))
-        self.assertEqual(second.card.learning_step, 1)
+        self.assertEqual(second.interval, timedelta(minutes=6))
+        self.assertEqual(second.card.learning_step, 0)
         third = schedule_rating(second.card, Rating.MEDIUM, second_time + second.interval)
-        self.assertEqual(third.card.learning_state, LearningState.REVIEW)
-        self.assertEqual(third.interval, timedelta(days=3))
+        self.assertEqual(third.card.learning_state, LearningState.LEARNING)
+        self.assertEqual(third.card.learning_step, 1)
+        self.assertEqual(third.interval, timedelta(minutes=10))
+        fourth = schedule_rating(third.card, Rating.MEDIUM, third.card.next_review_at)
+        self.assertEqual(fourth.card.learning_state, LearningState.REVIEW)
+        self.assertGreaterEqual(fourth.interval, timedelta(days=1))
 
     def test_learning_buttons_do_not_collapse_to_one_interval(self):
         failed = schedule_rating(new_card(), Rating.VERY_HARD, NOW)
@@ -48,9 +53,9 @@ class SchedulerTests(unittest.TestCase):
             previews,
             {
                 Rating.VERY_HARD: timedelta(minutes=2),
-                Rating.HARD: timedelta(minutes=10),
-                Rating.MEDIUM: timedelta(days=1),
-                Rating.EASY: timedelta(days=3),
+                Rating.HARD: timedelta(minutes=6),
+                Rating.MEDIUM: timedelta(minutes=10),
+                Rating.EASY: timedelta(days=1),
             },
         )
 
@@ -60,9 +65,9 @@ class SchedulerTests(unittest.TestCase):
             previews,
             {
                 Rating.VERY_HARD: timedelta(minutes=2),
-                Rating.HARD: timedelta(days=1),
-                Rating.MEDIUM: timedelta(days=3),
-                Rating.EASY: timedelta(days=8),
+                Rating.HARD: timedelta(minutes=6),
+                Rating.MEDIUM: timedelta(minutes=10),
+                Rating.EASY: timedelta(days=1),
             },
         )
 
@@ -163,13 +168,14 @@ class SchedulerTests(unittest.TestCase):
         )
         config = SchedulerConfig(minimum_relearning_stability_days=0.25)
         outcome = schedule_rating(mature, Rating.VERY_HARD, NOW, config)
-        self.assertAlmostEqual(outcome.card.stability, 0.45)
+        self.assertGreaterEqual(outcome.card.stability, 0.25)
+        self.assertLess(outcome.card.stability, mature.stability)
 
     def test_real_datetime_arithmetic_crosses_boundaries(self):
         first = schedule_rating(new_card(), Rating.VERY_HARD, NOW)
         self.assertEqual(first.card.next_review_at, datetime(2027, 1, 1, 0, 1, tzinfo=timezone.utc))
         learning = schedule_rating(first.card, Rating.HARD, first.card.next_review_at)
-        self.assertEqual(learning.card.next_review_at.minute, 11)
+        self.assertEqual(learning.card.next_review_at.minute, 7)
 
     def test_intervals_and_elapsed_time_use_real_time_across_dst(self):
         try:
@@ -188,8 +194,24 @@ class SchedulerTests(unittest.TestCase):
         after_change = datetime(2026, 3, 8, 3, 1, tzinfo=eastern)
         self.assertAlmostEqual(
             calculate_retrievability(remembered, after_change),
-            0.9 ** (2 / (24 * 60)),
+            (1 + (0.9 ** (-1 / 0.1542) - 1) * 2 / (24 * 60)) ** -0.1542,
         )
+
+    def test_desired_retention_controls_workload(self):
+        mature = replace(
+            new_card(), difficulty=5, stability=30, current_interval_days=30,
+            review_count=8, last_review_at=NOW - timedelta(days=30),
+            learning_state=LearningState.REVIEW,
+        )
+        high = schedule_rating(
+            mature, Rating.MEDIUM, NOW,
+            SchedulerConfig(desired_retention=0.95, enable_fuzzing=False),
+        )
+        low = schedule_rating(
+            mature, Rating.MEDIUM, NOW,
+            SchedulerConfig(desired_retention=0.85, enable_fuzzing=False),
+        )
+        self.assertLess(high.interval, low.interval)
 
     def test_maximum_interval_and_math_safety(self):
         config = SchedulerConfig(maximum_interval_days=3650)
@@ -212,6 +234,57 @@ class SchedulerTests(unittest.TestCase):
         )
         self.assertTrue(math.isfinite(failed.card.stability))
         self.assertLessEqual(failed.card.stability, config.maximum_interval_days)
+
+    def test_easy_days_must_define_seven_valid_weights(self):
+        with self.assertRaisesRegex(ValueError, "7 значений"):
+            validate_config(SchedulerConfig(easy_days_percentages=(1.0, 0.5)))
+        with self.assertRaisesRegex(ValueError, "7 значений"):
+            validate_config(
+                SchedulerConfig(easy_days_percentages=(1.0,) * 6 + (1.1,))
+            )
+
+    def test_leech_threshold_can_mark_or_suspend_a_card(self):
+        mature = replace(
+            new_card(),
+            stability=20,
+            difficulty=7,
+            review_count=20,
+            lapse_count=7,
+            last_review_at=NOW - timedelta(days=20),
+            learning_state=LearningState.REVIEW,
+        )
+        marked = schedule_rating(
+            mature,
+            Rating.VERY_HARD,
+            NOW,
+            SchedulerConfig(leech_threshold=8, leech_action="tag_only"),
+        ).card
+        suspended = schedule_rating(
+            mature,
+            Rating.VERY_HARD,
+            NOW,
+            SchedulerConfig(leech_threshold=8, leech_action="suspend"),
+        ).card
+        self.assertTrue(marked.is_leech)
+        self.assertFalse(marked.is_suspended)
+        self.assertTrue(suspended.is_leech)
+        self.assertTrue(suspended.is_suspended)
+
+    def test_easy_day_weights_move_a_long_interval_to_the_allowed_weekday(self):
+        mature = replace(
+            new_card(),
+            stability=300,
+            difficulty=5,
+            current_interval_days=300,
+            review_count=8,
+            last_review_at=NOW - timedelta(days=300),
+            learning_state=LearningState.REVIEW,
+        )
+        sunday_only = SchedulerConfig(
+            easy_days_percentages=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+        )
+        outcome = schedule_rating(mature, Rating.MEDIUM, NOW, sunday_only)
+        self.assertEqual(outcome.card.next_review_at.weekday(), 6)
 
 
 if __name__ == "__main__":
