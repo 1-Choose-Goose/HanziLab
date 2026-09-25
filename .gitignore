@@ -7,6 +7,7 @@ dist/
 release/
 output/
 tmp/
+dictionary-server.json
 .idea/
 data/hanzi.db
 data/dictionary.db

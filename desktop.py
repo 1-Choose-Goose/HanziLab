@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import re
 import sys
 import unicodedata
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QLayout,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -43,15 +45,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import database
+import dictionary_remote
 from copybook_pdf import (
     CopybookError,
     CopybookStyle,
     generate_hanzi_copybook,
     suggested_copybook_name,
 )
+from cursive_view import CursivePage
 from database import DB_PATH, get_examples, get_stats, search_entries, warm_search_index
 from handwriting_view import HandwritingDialog
-from cursive_view import CursivePage
 from scripts.text_normalization import CJK_RE
 from scripts.text_normalization import normalize_pinyin as _pinyin_base
 from stroke_order import StrokeOrderPanel
@@ -121,6 +125,41 @@ class BackgroundTask(QRunnable):
             result = None
             error = RuntimeError("background task cancelled")
         self.signals.finished.emit(self.generation, result, error)
+
+
+class DictionaryDownloadSignals(QObject):
+    progress = Signal(int)
+    finished = Signal(object, object)
+
+
+class DictionaryDownloadTask(QRunnable):
+    category = "dictionary-download"
+
+    def __init__(self, destination: Path) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.destination = destination
+        self.cancelled = False
+        self.signals = DictionaryDownloadSignals()
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = dictionary_remote.download_dictionary(
+                self.destination,
+                progress=lambda downloaded, total: self.signals.progress.emit(
+                    min(100, round(downloaded * 100 / total))
+                ),
+                cancelled=lambda: self.cancelled,
+            )
+            error = None
+        except Exception as exception:  # noqa: BLE001 - boundary of worker task.
+            result = None
+            error = exception
+        self.signals.finished.emit(result, error)
 
 
 def _split_compact_pinyin(value: str, syllable_count: int) -> list[str] | None:
@@ -293,12 +332,28 @@ class HanziLabWindow(QMainWindow):
         self.current_examples: list[dict] = []
         self.search_generation = 0
         self.examples_generation = 0
+        self.dictionary_stats_generation = 0
         self.closing = False
+        self.dictionary_source_connected = False
         self.background_pool = QThreadPool(self)
-        self.background_pool.setMaxThreadCount(3)
+        self.background_pool.setMaxThreadCount(2)
         self.background_tasks: set[BackgroundTask] = set()
         self.study_repository = study_repository or StudyRepository()
         self.settings = QSettings("HanziLab", "HanziLab")
+        saved_source = self.settings.value("dictionary_source", "server", type=str)
+        forced_local = os.environ.get("HANZILAB_DICTIONARY_LOCAL") == "1"
+        self.dictionary_source = (
+            "local"
+            if forced_local or (saved_source == "local" and database.FULL_DB_PATH.exists())
+            else "server"
+        )
+        if self.dictionary_source == "local":
+            os.environ["HANZILAB_DICTIONARY_LOCAL"] = "1"
+            if database.FULL_DB_PATH.exists():
+                database.use_local_dictionary()
+        else:
+            os.environ.pop("HANZILAB_DICTIONARY_LOCAL", None)
+            self.settings.setValue("dictionary_source", "server")
         font_default_version = self.settings.value("font_default_version", 0, type=int)
         if font_default_version < 1:
             saved_font = KAITI_FAMILY
@@ -323,8 +378,9 @@ class HanziLabWindow(QMainWindow):
         self.page_stack.setObjectName("pageStack")
         self.page_stack.addWidget(self.create_content())
         self.page_stack.addWidget(self.create_cards_page())
-        self.cursive_page = CursivePage(self)
-        self.page_stack.addWidget(self.cursive_page)
+        self.cursive_page: CursivePage | None = None
+        self.cursive_placeholder = QWidget()
+        self.page_stack.addWidget(self.cursive_placeholder)
         self.page_stack.addWidget(self.create_about_page())
         shell.addWidget(self.page_stack, 1)
 
@@ -340,6 +396,7 @@ class HanziLabWindow(QMainWindow):
         self.search_input.textChanged.connect(self.on_search_text_changed)
         self.search_input.returnPressed.connect(self.run_search)
         self.show_empty_state()
+        self.refresh_dictionary_stats()
 
     def schedule_search_warmup(self) -> None:
         """Прогреть FTS после показа окна, не задерживая запуск интерфейса."""
@@ -433,13 +490,159 @@ class HanziLabWindow(QMainWindow):
         layout.addWidget(self.font_selector)
         layout.addSpacing(12)
 
-        stats = get_stats()
-        local = QLabel(f"Локальная база\n{stats['entries']:,} слов".replace(",", " "))
-        local.setObjectName("localStatus")
-        layout.addWidget(local)
+        database_label = QLabel("БАЗА СЛОВАРЯ")
+        database_label.setObjectName("sidebarSection")
+        layout.addWidget(database_label)
+
+        self.dictionary_entries: int | None = None
+        status_panel = QFrame()
+        status_panel.setObjectName("localStatus")
+        status_layout = QVBoxLayout(status_panel)
+        status_layout.setContentsMargins(14, 14, 14, 14)
+        status_layout.setSpacing(7)
+        self.dictionary_status_title = QLabel()
+        self.dictionary_status_title.setObjectName("dictionaryStatusTitle")
+        self.dictionary_status = QLabel()
+        self.dictionary_status.setObjectName("dictionaryStatusDetails")
+        status_layout.addWidget(self.dictionary_status_title)
+        status_layout.addWidget(self.dictionary_status)
+        layout.addWidget(status_panel)
+
+        self.dictionary_source_selector = QComboBox()
+        self.dictionary_source_selector.setObjectName("dictionarySource")
+        self.dictionary_source_selector.addItem("Серверная база", "server")
+        self.dictionary_source_selector.addItem("Локальная база", "local")
+        local_item = self.dictionary_source_selector.model().item(1)
+        if local_item is not None:
+            local_item.setEnabled(database.FULL_DB_PATH.exists())
+        source_index = self.dictionary_source_selector.findData(self.dictionary_source)
+        self.dictionary_source_selector.setCurrentIndex(max(source_index, 0))
+        self.dictionary_source_selector.currentIndexChanged.connect(
+            self.change_dictionary_source
+        )
+        self.dictionary_source_connected = True
+        layout.addWidget(self.dictionary_source_selector)
+
+        self.download_dictionary_button = QPushButton(
+            "Обновить локальную базу"
+            if database.FULL_DB_PATH.exists()
+            else "Скачать базу"
+        )
+        self.download_dictionary_button.setObjectName("downloadDictionary")
+        self.download_dictionary_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.download_dictionary_button.clicked.connect(self.start_dictionary_download)
+        layout.addWidget(self.download_dictionary_button)
+        self.update_dictionary_status()
         return sidebar
 
+    def update_dictionary_status(self) -> None:
+        label = "Локальная база" if self.dictionary_source == "local" else "Серверная база"
+        details = (
+            f"{self.dictionary_entries:,} слов".replace(",", " ")
+            if self.dictionary_entries is not None
+            else "Получение данных…"
+        )
+        self.dictionary_status_title.setText(label)
+        self.dictionary_status.setText(details)
+
+    def refresh_dictionary_stats(self) -> None:
+        self.dictionary_stats_generation += 1
+        generation = self.dictionary_stats_generation
+        source = self.dictionary_source
+        self.dictionary_entries = None
+        self.update_dictionary_status()
+        self.cancel_background_tasks("dictionary-stats")
+        task = BackgroundTask(
+            generation, get_stats, category="dictionary-stats"
+        )
+        task.signals.finished.connect(
+            lambda task_generation, result, error, requested_source=source:
+                self.apply_dictionary_stats(
+                    task_generation, requested_source, result, error
+                )
+        )
+        self.start_background_task(task)
+
+    def apply_dictionary_stats(
+        self, generation: int, source: str, result: object, error: object
+    ) -> None:
+        if (
+            self.closing
+            or generation != self.dictionary_stats_generation
+            or source != self.dictionary_source
+        ):
+            return
+        if error is not None or not isinstance(result, dict):
+            label = "Локальная база" if source == "local" else "Серверная база"
+            self.dictionary_status_title.setText(label)
+            self.dictionary_status.setText("Недоступна")
+            return
+        self.dictionary_entries = int(result.get("entries", 0))
+        self.update_dictionary_status()
+
+    def change_dictionary_source(self, _index: int = -1) -> None:
+        source = self.dictionary_source_selector.currentData()
+        if source not in {"server", "local"}:
+            return
+        if source == "local" and not database.FULL_DB_PATH.exists():
+            self.dictionary_source_selector.setCurrentIndex(
+                self.dictionary_source_selector.findData("server")
+            )
+            return
+        self.dictionary_source = source
+        self.settings.setValue("dictionary_source", source)
+        if source == "local":
+            os.environ["HANZILAB_DICTIONARY_LOCAL"] = "1"
+            database.use_local_dictionary()
+        else:
+            os.environ.pop("HANZILAB_DICTIONARY_LOCAL", None)
+            database._close_thread_connection()
+        self.refresh_dictionary_stats()
+
+    def start_dictionary_download(self) -> None:
+        if self.dictionary_source == "local":
+            self.dictionary_source_selector.setCurrentIndex(
+                self.dictionary_source_selector.findData("server")
+            )
+        self.download_dictionary_button.setEnabled(False)
+        self.download_dictionary_button.setText("Загрузка · 0%")
+        task = DictionaryDownloadTask(database.FULL_DB_PATH)
+        task.signals.progress.connect(
+            lambda percent: self.download_dictionary_button.setText(
+                f"Загрузка · {percent}%"
+            )
+        )
+        task.signals.finished.connect(self.finish_dictionary_download)
+        self.start_background_task(task)
+
+    def finish_dictionary_download(self, path: object, error: object) -> None:
+        if self.closing:
+            return
+        self.download_dictionary_button.setEnabled(True)
+        self.download_dictionary_button.setText(
+            "Обновить локальную базу" if path else "Скачать базу"
+        )
+        if error is not None:
+            if str(error) != "Загрузка отменена":
+                QMessageBox.warning(self, "Не удалось скачать базу", str(error))
+            return
+        local_item = self.dictionary_source_selector.model().item(1)
+        if local_item is not None:
+            local_item.setEnabled(True)
+        QMessageBox.information(
+            self,
+            "База загружена",
+            "Локальная база готова. Теперь её можно выбрать в списке источников.",
+        )
+
     def show_page(self, index: int) -> None:
+        if self.page_stack.currentIndex() == index:
+            return
+        if index == 2 and self.cursive_page is None:
+            self.cursive_page = CursivePage(self)
+            self.page_stack.removeWidget(self.cursive_placeholder)
+            self.cursive_placeholder.deleteLater()
+            self.page_stack.insertWidget(2, self.cursive_page)
         self.page_stack.setCurrentIndex(index)
         self.dictionary_button.setObjectName("navActive" if index == 0 else "navButton")
         self.cards_button.setObjectName("navActive" if index == 1 else "navButton")
@@ -477,45 +680,103 @@ class HanziLabWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("aboutPage")
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(38, 30, 38, 32)
+        layout.setContentsMargins(32, 28, 32, 24)
         layout.setSpacing(12)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
-        title = QLabel("О программе")
+        title = QLabel("О HanziLab")
         title.setObjectName("pageTitle")
         layout.addWidget(title)
 
         subtitle = QLabel(
-            "HanziLab — приложение для изучения китайских иероглифов и слов."
+            "Китайский язык — от первого штриха до уверенного знания."
         )
         subtitle.setObjectName("pageSubtitle")
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
-        layout.addSpacing(18)
+        layout.addSpacing(12)
 
         card = QFrame()
         card.setObjectName("aboutCard")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(24, 22, 24, 22)
-        card_layout.setSpacing(12)
+        card_layout.setContentsMargins(24, 24, 24, 24)
+        card_layout.setSpacing(20)
+        card_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
-        developer = QLabel(f"Разработчик: {DEVELOPER_NAME}")
+        identity = QHBoxLayout()
+        identity.setSpacing(18)
+        mark = QLabel("汉")
+        mark.setObjectName("aboutMark")
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setFixedSize(58, 58)
+        mark.setFont(QFont(XINGSHU_FAMILY, 30))
+        identity.addWidget(mark)
+
+        identity_text = QVBoxLayout()
+        identity_text.setSpacing(3)
+        role = QLabel("СОЗДАТЕЛЬ HANZILAB")
+        role.setObjectName("aboutRole")
+        role.setWordWrap(True)
+        identity_text.addWidget(role)
+
+        developer = QLabel(DEVELOPER_NAME)
         developer.setObjectName("aboutDeveloper")
-        card_layout.addWidget(developer)
+        identity_text.addWidget(developer)
+        identity.addLayout(identity_text, 1)
+        card_layout.addLayout(identity)
 
-        contacts = QLabel(
-            f'<a href="{VK_URL}">VK</a><br>'
-            f'<a href="{TELEGRAM_URL}">Telegram: @choose_o_goose</a><br>'
-            f'<a href="{TELEGRAM_CHANNEL_URL}">Telegram-канал «一笔一画»</a>'
+        divider = QFrame()
+        divider.setObjectName("aboutDivider")
+        divider.setFrameShape(QFrame.Shape.HLine)
+        card_layout.addWidget(divider)
+
+        description = QLabel(
+            "Словарь, интервальные карточки, порядок черт и прописи собраны "
+            "в одном спокойном рабочем пространстве."
         )
+        description.setObjectName("aboutDescription")
+        description.setWordWrap(True)
+        card_layout.addWidget(description)
+
+        contact_title = QLabel("КОНТАКТЫ И ОБНОВЛЕНИЯ")
+        contact_title.setObjectName("aboutContactTitle")
+        contact_title.setWordWrap(True)
+        card_layout.addWidget(contact_title)
+
+        contacts = QFrame()
         contacts.setObjectName("aboutContacts")
-        contacts.setTextFormat(Qt.TextFormat.RichText)
-        contacts.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        contacts.setOpenExternalLinks(True)
+        contacts_layout = QVBoxLayout(contacts)
+        contacts_layout.setContentsMargins(18, 16, 18, 16)
+        contacts_layout.setSpacing(14)
+        for url, text in (
+            (VK_URL, "VK · профиль разработчика ↗"),
+            (TELEGRAM_URL, "Telegram · @choose_o_goose ↗"),
+            (TELEGRAM_CHANNEL_URL, "Канал · «一笔一画» ↗"),
+        ):
+            link = QLabel(
+                f'<a style="color:#C94D3C;text-decoration:none" href="{url}">{text}</a>'
+            )
+            link.setObjectName("aboutContactLink")
+            link.setWordWrap(True)
+            link.setTextFormat(Qt.TextFormat.RichText)
+            link.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+            link.setOpenExternalLinks(True)
+            contacts_layout.addWidget(link)
         card_layout.addWidget(contacts)
 
         layout.addWidget(card)
+
+        footer = QLabel("汉字 · Пиньинь · Перевод · Практика")
+        footer.setObjectName("aboutFooter")
+        footer.setWordWrap(True)
+        layout.addWidget(footer)
         layout.addStretch()
-        return page
+        scroll = QScrollArea()
+        scroll.setObjectName("aboutScroll")
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(page)
+        return scroll
 
     def create_content(self) -> QWidget:
         content = QWidget()
@@ -944,7 +1205,7 @@ class HanziLabWindow(QMainWindow):
             return
         if error is not None:
             self.result_title.setText("Не удалось выполнить поиск")
-            self.result_count.clear()
+            self.result_count.setText("Проверьте интернет и повторите запрос" if dictionary_remote.enabled() else "Словарь недоступен")
             self.detail_stack.setCurrentIndex(0)
             return
         self.results = list(rows or [])
@@ -1069,6 +1330,15 @@ class HanziLabWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.closing = True
+        try:
+            if not self.dictionary_source_connected:
+                raise AttributeError
+            self.dictionary_source_selector.currentIndexChanged.disconnect(
+                self.change_dictionary_source
+            )
+            self.dictionary_source_connected = False
+        except (AttributeError, RuntimeError):
+            pass
         self.search_generation += 1
         self.examples_generation += 1
         self.pending_result = None
@@ -1107,15 +1377,27 @@ QPushButton#navActive:hover { background: #2C4047; }
 QPushButton#navButton { background: transparent; color: #B3C0C5; }
 QPushButton#navButton:hover { background: #1A2A30; color: #FFFFFF; }
 QPushButton#navDisabled { background: transparent; color: #71838B; }
-QFrame#aboutCard { background: #FFFFFF; border: 1px solid #DFE4E6; border-radius: 12px; }
-QLabel#aboutDeveloper { color: #243139; font-size: 16px; font-weight: 600; }
-QLabel#aboutContacts { color: #526168; font-size: 14px; line-height: 1.6; }
-QLabel#aboutContacts a { color: #D45240; text-decoration: none; }
-QLabel#localStatus { color: #83949B; background: #17262C; border-radius: 10px; padding: 13px; font-size: 12px; line-height: 1.5; }
+QWidget#aboutPage { background: #F4F6F8; }
+QFrame#aboutCard { background: #FFFFFF; border: 1px solid #DDE4E6; border-radius: 16px; }
+QLabel#aboutMark { background: #E05945; color: #FFFFFF; border-radius: 14px; }
+QLabel#aboutRole, QLabel#aboutContactTitle { color: #829198; font-size: 10px; font-weight: 700; letter-spacing: 1.5px; }
+QLabel#aboutDeveloper { color: #1D2B31; font-size: 18px; font-weight: 700; }
+QFrame#aboutDivider { color: #E8ECEE; background: #E8ECEE; border: none; max-height: 1px; }
+QLabel#aboutDescription { color: #536269; font-size: 14px; line-height: 1.55; }
+QFrame#aboutContacts { background: #F7F9F9; border: 1px solid #E5EAEC; border-radius: 10px; }
+QLabel#aboutContactLink { background: transparent; border: none; font-size: 14px; }
+QLabel#aboutFooter { color: #91A0A6; font-size: 11px; letter-spacing: 0.7px; padding: 10px 2px; }
+QFrame#localStatus { background: #17262C; border-radius: 10px; }
+QLabel#dictionaryStatusTitle { color: #83949B; font-size: 12px; background: transparent; }
+QLabel#dictionaryStatusDetails { color: #B3C1C7; font-size: 13px; background: transparent; }
 QComboBox#fontSelector { background: #17262C; color: #D8E1E4; border: 1px solid #2A3C43; border-radius: 9px; padding: 9px 11px; font-size: 12px; }
-QComboBox#fontSelector:hover { border-color: #496069; }
-QComboBox#fontSelector::drop-down { border: none; width: 24px; }
-QComboBox#fontSelector QAbstractItemView { background: #17262C; color: #EAF0F2; border: 1px solid #2A3C43; selection-background-color: #E05945; outline: none; }
+QComboBox#dictionarySource { background: #17262C; color: #D8E1E4; border: 1px solid #2A3C43; border-radius: 9px; padding: 8px 10px; font-size: 11px; }
+QComboBox#fontSelector:hover, QComboBox#dictionarySource:hover { border-color: #496069; }
+QComboBox#fontSelector::drop-down, QComboBox#dictionarySource::drop-down { border: none; width: 24px; }
+QComboBox#fontSelector QAbstractItemView, QComboBox#dictionarySource QAbstractItemView { background: #17262C; color: #EAF0F2; border: 1px solid #2A3C43; selection-background-color: #E05945; outline: none; }
+QPushButton#downloadDictionary { background: transparent; color: #D6E0E3; border: 1px solid #354A52; border-radius: 9px; padding: 8px 10px; font-size: 11px; }
+QPushButton#downloadDictionary:hover { background: #24343A; border-color: #526A73; color: #FFFFFF; }
+QPushButton#downloadDictionary:disabled { color: #71838B; border-color: #293B42; }
 QWidget#content { background: #F4F6F8; }
 QWidget#cursivePage { background: #F4F6F8; color: #182026; }
 QLineEdit#cursiveSearch { background: #FFFFFF; color: #243139; border: 1px solid #DCE2E5; border-radius: 10px; padding: 2px 13px; font-size: 15px; }
@@ -1285,7 +1567,7 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 
 def main() -> None:
     smoke_test = "--smoke-test" in sys.argv
-    if not smoke_test and not DB_PATH.exists():
+    if not smoke_test and not dictionary_remote.enabled() and not DB_PATH.exists():
         raise SystemExit("В комплекте приложения не найдена база HanziLab")
     app = QApplication(sys.argv)
     app.setApplicationName("HanziLab")

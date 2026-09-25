@@ -744,10 +744,13 @@ class StudyUiTests(unittest.TestCase):
             self.assertIsNotNone(window.study_page.current_item)
             presentation_id = window.study_page.current_item.presentation_id
             first_shown_at = window.study_page.current_item.shown_at
+            session = window.study_page.session
 
             window.show_page(0)
             self.app.processEvents()
-            self.assertIsNone(window.study_page.current_item)
+            self.assertIsNotNone(window.study_page.current_item)
+            self.assertEqual(window.study_page.current_item.presentation_id, presentation_id)
+            self.assertIs(window.study_page.session, session)
             QTest.qWait(10)
             window.show_page(1)
             self.app.processEvents()

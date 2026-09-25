@@ -54,7 +54,7 @@ class AppIconTests(unittest.TestCase):
             self.assertEqual(window.page_stack.currentIndex(), 3)
             developer = window.findChild(QLabel, "aboutDeveloper")
             contacts = window.findChild(QLabel, "aboutContacts")
-            self.assertEqual(developer.text(), "Разработчик: Choose_Goose")
+            self.assertEqual(developer.text(), "Choose_Goose")
             self.assertTrue(contacts.openExternalLinks())
             self.assertEqual(
                 contacts.textInteractionFlags(),

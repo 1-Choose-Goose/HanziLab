@@ -132,6 +132,21 @@ class UiRegressionTests(unittest.TestCase):
             window.deleteLater()
             row.deleteLater()
 
+    def test_cursive_catalogue_is_created_only_when_opened(self):
+        with patch.object(desktop, "get_stats", return_value={"entries": 0}):
+            window = desktop.HanziLabWindow(self.repository)
+        try:
+            self.assertIsNone(window.cursive_page)
+            window.show_page(2)
+            self.assertIsNotNone(window.cursive_page)
+            created = window.cursive_page
+            window.show_page(0)
+            window.show_page(2)
+            self.assertIs(window.cursive_page, created)
+        finally:
+            window.close()
+            window.deleteLater()
+
 
 if __name__ == "__main__":
     unittest.main()
