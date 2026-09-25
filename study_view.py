@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal, Slot
@@ -14,8 +15,8 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
-    QHeaderView,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -509,7 +510,7 @@ class StudyPage(QWidget):
         self.current_item: SessionItem | None = None
         self.example_generation = 0
         self.example_pool = QThreadPool(self)
-        self.example_pool.setMaxThreadCount(2)
+        self.example_pool.setMaxThreadCount(1)
         self.example_tasks: set[ExampleLoadTask] = set()
         self.dictionary_tasks: set[DictionaryLookupTask] = set()
         self.anki_import_generation = 0
@@ -520,6 +521,7 @@ class StudyPage(QWidget):
         self.current_examples_error: Exception | None = None
         self.examples_requested_visible = False
         self.session_active = False
+        self.deactivated_at = None
         self.shutting_down = False
 
         root = QVBoxLayout(self)
@@ -997,20 +999,24 @@ class StudyPage(QWidget):
         if self.shutting_down:
             return
         self.session_active = True
+        if self.current_item is not None:
+            now = utc_now()
+            if self.deactivated_at is not None:
+                self.current_item = replace(
+                    self.current_item,
+                    shown_at=self.current_item.shown_at + (now - self.deactivated_at),
+                )
+            self.deactivated_at = None
+            return
+        self.deactivated_at = None
         self.initial_refresh_timer.start(0)
 
     def deactivate(self) -> None:
         if not self.session_active:
             return
         self.session_active = False
+        self.deactivated_at = utc_now()
         self.initial_refresh_timer.stop()
-        if self.current_item is not None:
-            self.current_item = None
-            self.invalidate_examples()
-            self.body.setCurrentIndex(0)
-        # A fresh service resumes an unfinished presentation with the same
-        # direction and restarts shown_at when the page is actually visible.
-        self.session = StudySessionService(self.repository)
 
     def shutdown(self) -> None:
         self.deactivate()

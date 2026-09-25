@@ -9,8 +9,8 @@ from functools import lru_cache
 from itertools import product
 from pathlib import Path
 
-from app_paths import select_dictionary_path
-
+import dictionary_remote
+from app_paths import USER_DATA_DIR, placeholder_dictionary_path, select_dictionary_path
 from scripts.text_normalization import (
     CJK_RE,
     PINYIN_VARIANT_RE,
@@ -19,6 +19,8 @@ from scripts.text_normalization import (
     normalized_pinyin_variants,
 )
 
+FULL_DB_PATH = USER_DATA_DIR / "hanzi.db"
+PLACEHOLDER_DB_PATH = placeholder_dictionary_path()
 DB_PATH = select_dictionary_path()
 ORIGINAL_VOCABULARY_SIZE = 1204
 
@@ -111,6 +113,13 @@ def _close_thread_connection() -> None:
     _THREAD_CONNECTION.holder = None
 
 
+def use_local_dictionary(path: Path = FULL_DB_PATH) -> None:
+    """Point subsequent calls at a freshly downloaded local dictionary."""
+    global DB_PATH
+    _close_thread_connection()
+    DB_PATH = path
+
+
 def _database_key() -> str:
     # DB_PATH уже абсолютен. Path.resolve()/stat() на Windows могут занимать
     # десятки миллисекунд, поэтому не трогаем файловую систему на каждый запрос.
@@ -118,6 +127,8 @@ def _database_key() -> str:
 
 
 def get_stats() -> dict[str, int]:
+    if dictionary_remote.enabled():
+        return dictionary_remote.call("stats")
     with closing(connect_dictionary()) as connection:
         # ANALYZE хранит число строк в sqlite_stat1, не требуя COUNT(*)
         # по 3,45 млн элементов. Свежесозданная база может ещё не иметь
@@ -144,6 +155,8 @@ def warm_search_index() -> None:
     Вызывать один раз в фоновом потоке после показа окна. Каждый
     запрос останавливается на первом совпадении.
     """
+    if dictionary_remote.enabled():
+        return
     connection = _thread_connection()
     connection.execute(
         "SELECT rowid FROM entries WHERE hanzi >= ? ORDER BY hanzi LIMIT 1",
@@ -284,6 +297,8 @@ def _curated_search_rows(
 
 
 def search_entries(query: str, limit: int = 50) -> list[dict]:
+    if dictionary_remote.enabled():
+        return dictionary_remote.call("search", query=query, limit=min(max(limit, 1), 100)) if query.strip() else []
     query = unicodedata.normalize("NFKC", query).strip()
     if not query:
         return []
@@ -395,6 +410,11 @@ def get_entries_by_hanzi(words) -> dict[str, dict]:
     requested = tuple(dict.fromkeys(word.strip() for word in words if word.strip()))
     if not requested:
         return {}
+    if dictionary_remote.enabled():
+        found = {}
+        for offset in range(0, len(requested), 100):
+            found.update(dictionary_remote.call("entries", words=requested[offset:offset + 100]))
+        return found
     connection = _thread_connection()
     found: dict[str, dict] = {}
     for offset in range(0, len(requested), 900):
@@ -410,6 +430,8 @@ def get_entries_by_hanzi(words) -> dict[str, dict]:
 
 
 def get_examples(hanzi: str, limit: int = 6, pinyin: str = "") -> list[dict]:
+    if dictionary_remote.enabled():
+        return dictionary_remote.call("examples", hanzi=hanzi, limit=min(max(limit, 1), 20), pinyin=pinyin)
     del pinyin  # Чтение не меняет поиск: примеры связаны с написанием слова.
     hanzi = _hanzi_query(hanzi)
     if not hanzi:

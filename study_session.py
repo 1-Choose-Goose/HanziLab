@@ -185,8 +185,10 @@ class StudySessionService:
             start_position += len(unfinished)
         if len(existing_ids) >= limit:
             return
+        remaining = limit - len(existing_ids)
+        candidates = self.repository.get_daily_candidates(date_key, now, remaining)
         selections = select_daily_cards(
-            self.repository.get_cards(), existing_ids, limit, now, self.rng
+            candidates, set(), remaining, now, self.rng
         )
         rows = [
             (selection.card_id, selection.direction.value, start_position + index)
@@ -197,14 +199,8 @@ class StudySessionService:
     def can_continue(self, now: datetime) -> bool:
         """Whether another due/new logical card can be added without moving its due date."""
         self.ensure_daily_session(now)
-        existing_ids = {
-            int(row["card_id"])
-            for row in self.repository.daily_rows(local_date(now))
-        }
-        now = ensure_aware(now)
-        return any(
-            card.id not in existing_ids and _is_available(card, now)
-            for card in self.repository.get_cards()
+        return bool(
+            self.repository.get_daily_candidates(local_date(now), now, 1)
         )
 
     def continue_daily_session(self, now: datetime) -> int:
@@ -214,12 +210,11 @@ class StudySessionService:
         existing = self.repository.daily_rows(date_key)
         existing_ids = {int(row["card_id"]) for row in existing}
         batch_size = self.repository.get_daily_limit()
+        candidates = self.repository.get_daily_candidates(
+            date_key, now, batch_size
+        )
         selections = select_daily_cards(
-            self.repository.get_cards(),
-            existing_ids,
-            len(existing_ids) + batch_size,
-            now,
-            self.rng,
+            candidates, set(), batch_size, now, self.rng
         )
         if not selections:
             return 0

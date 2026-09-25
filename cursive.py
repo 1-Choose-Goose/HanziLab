@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, lru_cache
 from pathlib import Path
 
 from text_formatting import is_cjk
@@ -64,6 +64,7 @@ def stroke_count(character: str) -> int:
     return STROKE_COUNT_FALLBACKS.get(character, 10_000)
 
 
+@lru_cache(maxsize=64)
 def group_samples(
     query: str = "", page: int | None = None
 ) -> dict[str, tuple[CursiveSample, ...]]:
@@ -136,6 +137,7 @@ class CursiveSearchResult:
     missing: tuple[str, ...] = ()
 
 
+@lru_cache(maxsize=128)
 def search_cursive(query: str) -> CursiveSearchResult:
     catalogue = group_samples()
     if not query.strip():

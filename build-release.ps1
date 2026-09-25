@@ -18,6 +18,9 @@ if ($foreignIcu) {
 }
 
 $dataDirectory = Join-Path $PSScriptRoot "dist\HanziLab\data"
+foreach ($configFile in @("dictionary-server.json", "dictionary-server-ca.pem")) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $configFile) -Destination (Join-Path $PSScriptRoot "dist\HanziLab\$configFile") -Force
+}
 New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
 
 $smokeTest = Start-Process -FilePath $executable -ArgumentList "--smoke-test" -Wait -PassThru -WindowStyle Hidden

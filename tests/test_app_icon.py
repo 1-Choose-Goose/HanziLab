@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QImage
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QFrame, QLabel
 
 import desktop
 from study_database import StudyRepository
@@ -53,19 +53,21 @@ class AppIconTests(unittest.TestCase):
 
             self.assertEqual(window.page_stack.currentIndex(), 3)
             developer = window.findChild(QLabel, "aboutDeveloper")
-            contacts = window.findChild(QLabel, "aboutContacts")
-            self.assertEqual(developer.text(), "Разработчик: Choose_Goose")
-            self.assertTrue(contacts.openExternalLinks())
-            self.assertEqual(
-                contacts.textInteractionFlags(),
-                Qt.TextInteractionFlag.TextBrowserInteraction,
-            )
-            for contact in (
+            contacts = window.findChild(QFrame, "aboutContacts")
+            self.assertEqual(developer.text(), "Choose_Goose")
+            links = contacts.findChildren(QLabel, "aboutContactLink")
+            self.assertEqual(len(links), 3)
+            for link, contact in zip(links, (
                 "https://vk.ru/kamereka",
                 "https://t.me/choose_o_goose",
                 "https://t.me/yi_bi_yi_hua",
-            ):
-                self.assertIn(contact, contacts.text())
+            )):
+                self.assertTrue(link.openExternalLinks())
+                self.assertEqual(
+                    link.textInteractionFlags(),
+                    Qt.TextInteractionFlag.TextBrowserInteraction,
+                )
+                self.assertIn(contact, link.text())
             window.close()
 
     def test_build_configuration_embeds_and_bundles_the_icon(self):

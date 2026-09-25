@@ -377,6 +377,42 @@ class StudyRepository:
             rows = connection.execute("SELECT * FROM cards ORDER BY id").fetchall()
         return [CardState.from_mapping(dict(row)) for row in rows]
 
+    def get_daily_candidates(
+        self, date_key: str, now: datetime, limit: int
+    ) -> list[CardState]:
+        """Return only the highest-priority cards needed to fill today's queue."""
+        if limit <= 0:
+            return []
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT c.*
+                FROM cards c
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM daily_cards d
+                    WHERE d.local_date=? AND d.card_id=c.id
+                )
+                  AND (
+                    c.priority_boost=1
+                    OR c.learning_state='NEW'
+                    OR c.next_review_at IS NULL
+                    OR c.next_review_at <= ?
+                  )
+                ORDER BY
+                    CASE
+                        WHEN c.priority_boost=1 THEN 0
+                        WHEN c.learning_state='LEARNING' THEN 1
+                        WHEN c.learning_state='NEW' THEN 2
+                        ELSE 3
+                    END,
+                    c.next_review_at,
+                    c.id
+                LIMIT ?
+                """,
+                (date_key, to_storage(now), int(limit)),
+            ).fetchall()
+        return [CardState.from_mapping(dict(row)) for row in rows]
+
     def get_card_count(self) -> int:
         with closing(self.connect()) as connection:
             return connection.execute("SELECT count(*) FROM cards").fetchone()[0]

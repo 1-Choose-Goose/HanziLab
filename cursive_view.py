@@ -191,11 +191,6 @@ class CursivePage(QWidget):
                 self.table.setCurrentItem(item)
         self.table.blockSignals(False)
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if hasattr(self, "table") and self.groups:
-            self.fill_table()
-
     def eventFilter(self, watched, event):
         if event.type() == QEvent.Type.Resize and self.groups:
             desired = max(4, self.table.viewport().width() // 54)
