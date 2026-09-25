@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import sqlite3
-import sys
 from collections.abc import Iterable
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+
+from app_paths import USER_DATA_DIR
 
 from scheduler import (
     CardState,
@@ -17,9 +18,7 @@ from scheduler import (
 )
 from text_formatting import normalize_display_text
 
-ROOT = Path(__file__).resolve().parent
-APP_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ROOT
-STUDY_DB_PATH = APP_ROOT / "data" / "study.db"
+STUDY_DB_PATH = USER_DATA_DIR / "study.db"
 SCHEMA_VERSION = 7
 DEFAULT_DAILY_REVIEW_LIMIT = 30
 DAILY_SESSION_LIMIT_PREFIX = "daily_session_limit:"

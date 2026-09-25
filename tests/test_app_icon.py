@@ -74,6 +74,9 @@ class AppIconTests(unittest.TestCase):
         )
         self.assertIn('"assets" / "icons"', spec)
         self.assertIn("hanzilab.ico", spec)
+        self.assertIn("hanzilab.icns", spec)
+        self.assertIn("BUNDLE", spec)
+        self.assertIn("io.github.choose-goose.hanzilab", spec)
 
     def test_window_title_is_not_duplicated_by_display_name(self):
         source = (Path(__file__).parents[1] / "desktop.py").read_text(

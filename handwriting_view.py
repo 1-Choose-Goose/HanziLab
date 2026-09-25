@@ -203,7 +203,8 @@ class HandwritingDialog(QDialog):
         self.recognition_timer.setSingleShot(True)
         self.recognition_timer.setInterval(160)
         self.recognition_timer.timeout.connect(self.start_recognition)
-        self.undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        # Uses Command+Z on macOS and Ctrl+Z on Windows/Linux.
+        self.undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
         self.undo_shortcut.setContext(
             Qt.ShortcutContext.WidgetWithChildrenShortcut
         )

@@ -7,6 +7,8 @@ import unicodedata
 from functools import cache
 from pathlib import Path
 
+from app_paths import RESOURCE_ROOT
+
 from pypinyin import Style, lazy_pinyin
 from PySide6.QtCore import (
     QEvent,
@@ -64,8 +66,8 @@ from text_formatting import (
 )
 
 APP_TITLE = "HanziLab — китайско-русский словарь"
-FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
-ICON_DIR = Path(__file__).resolve().parent / "assets" / "icons"
+FONT_DIR = RESOURCE_ROOT / "assets" / "fonts"
+ICON_DIR = RESOURCE_ROOT / "assets" / "icons"
 APP_ICON_PNG = ICON_DIR / "hanzilab.png"
 APP_ICON_ICO = ICON_DIR / "hanzilab.ico"
 KAITI_FAMILY = "KaiTi"
@@ -80,6 +82,35 @@ TELEGRAM_CHANNEL_URL = "https://t.me/yi_bi_yi_hua"
 
 class BackgroundTaskSignals(QObject):
     finished = Signal(int, object, object)
+
+
+class WindowCenteringFilter(QObject):
+    """Centers every application window on the screen where it is opened."""
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.Show and isinstance(
+            watched, (QMainWindow, QDialog)
+        ):
+            # Layouts finish calculating the window frame during the show event,
+            # so center it on the next pass through the event loop.
+            QTimer.singleShot(0, lambda window=watched: self.center(window))
+        return super().eventFilter(watched, event)
+
+    @staticmethod
+    def center(window: QWidget) -> None:
+        try:
+            parent = window.parentWidget()
+            screen = parent.screen() if parent is not None else window.screen()
+            if screen is None:
+                screen = QApplication.primaryScreen()
+            if screen is None:
+                return
+            frame = window.frameGeometry()
+            frame.moveCenter(screen.availableGeometry().center())
+            window.move(frame.topLeft())
+        except RuntimeError:
+            # A short-lived message box may be destroyed before the queued call.
+            pass
 
 
 class BackgroundTask(QRunnable):
@@ -1291,6 +1322,8 @@ def main() -> None:
     app.setApplicationName("HanziLab")
     app.setOrganizationName("HanziLab")
     app.setWindowIcon(QIcon(str(APP_ICON_PNG)))
+    window_centering_filter = WindowCenteringFilter(app)
+    app.installEventFilter(window_centering_filter)
     if smoke_test:
         return
     if sys.platform == "win32":

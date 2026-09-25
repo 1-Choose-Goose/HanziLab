@@ -13,3 +13,4 @@ data/dictionary.db
 data/study.db
 data/*.db-shm
 data/*.db-wal
+assets/icons/hanzilab.icns

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import re
 import sqlite3
-import sys
 import threading
 import unicodedata
 from contextlib import closing
 from functools import lru_cache
 from itertools import product
 from pathlib import Path
+
+from app_paths import select_dictionary_path
 
 from scripts.text_normalization import (
     CJK_RE,
@@ -18,15 +19,7 @@ from scripts.text_normalization import (
     normalized_pinyin_variants,
 )
 
-ROOT = Path(__file__).resolve().parent
-APP_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ROOT
-FULL_DB_PATH = APP_ROOT / "data" / "hanzi.db"
-PLACEHOLDER_DB_PATH = ROOT / "data" / "hanzi-placeholder.db"
-DB_PATH = (
-    FULL_DB_PATH
-    if FULL_DB_PATH.exists() or getattr(sys, "frozen", False)
-    else PLACEHOLDER_DB_PATH
-)
+DB_PATH = select_dictionary_path()
 ORIGINAL_VOCABULARY_SIZE = 1204
 
 CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")

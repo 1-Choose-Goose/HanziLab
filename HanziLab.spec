@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+import sys
 
 
 PROJECT_ROOT = Path(SPECPATH)
@@ -14,6 +15,7 @@ a = Analysis(
         (str(PROJECT_ROOT / "assets" / "icons"), "assets/icons"),
         (str(PROJECT_ROOT / "assets" / "strokes"), "assets/strokes"),
         (str(PROJECT_ROOT / "assets" / "cursive"), "assets/cursive"),
+        (str(PROJECT_ROOT / "data" / "hanzi-placeholder.db"), "data"),
     ],
     hiddenimports=[],
     hookspath=[],
@@ -31,11 +33,13 @@ a.binaries = [
     entry
     for entry in a.binaries
     if not (
+        sys.platform == "win32"
+        and (
         Path(entry[0]).name.lower() == "icuuc.dll"
         or (
             Path(entry[0]).name.lower().startswith("icudt")
             and Path(entry[0]).name.lower().endswith(".dll")
-        )
+        ))
     )
 ]
 
@@ -57,7 +61,12 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(PROJECT_ROOT / "assets" / "icons" / "hanzilab.ico"),
+    icon=str(
+        PROJECT_ROOT
+        / "assets"
+        / "icons"
+        / ("hanzilab.icns" if sys.platform == "darwin" else "hanzilab.ico")
+    ),
 )
 
 coll = COLLECT(
@@ -69,3 +78,19 @@ coll = COLLECT(
     upx_exclude=[],
     name="HanziLab",
 )
+
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="HanziLab.app",
+        icon=str(PROJECT_ROOT / "assets" / "icons" / "hanzilab.icns"),
+        bundle_identifier="io.github.choose-goose.hanzilab",
+        info_plist={
+            "CFBundleDisplayName": "HanziLab",
+            "CFBundleName": "HanziLab",
+            "CFBundleShortVersionString": "1.0.0",
+            "CFBundleVersion": "1",
+            "LSMinimumSystemVersion": "12.0",
+            "NSHighResolutionCapable": True,
+        },
+    )
