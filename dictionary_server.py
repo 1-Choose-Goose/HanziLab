@@ -4,7 +4,6 @@ import json
 import os
 import sqlite3
 import time
-from pathlib import Path
 
 import database
 
@@ -19,27 +18,6 @@ def application(environ, start_response):
     token = os.environ.get("HANZILAB_API_TOKEN", "")
     if not token or not hmac.compare_digest(environ.get("HTTP_AUTHORIZATION", ""), "Bearer " + token):
         return respond("401 Unauthorized", {"error": "Unauthorized"})
-    if environ.get("PATH_INFO") == "/v1/database":
-        if environ.get("REQUEST_METHOD") != "GET":
-            return respond("405 Method Not Allowed", {"error": "Use GET"})
-        path = Path(database.DB_PATH)
-        size = path.stat().st_size
-        start_response("200 OK", [
-            ("Content-Type", "application/vnd.sqlite3"),
-            ("Content-Length", str(size)),
-            ("Content-Disposition", 'attachment; filename="hanzi.db"'),
-            ("Cache-Control", "private, no-store"),
-        ])
-        wrapper = environ.get("wsgi.file_wrapper")
-        if wrapper:
-            return wrapper(path.open("rb"), 2 * 1024 * 1024)
-
-        def stream_file():
-            with path.open("rb") as stream:
-                while block := stream.read(2 * 1024 * 1024):
-                    yield block
-
-        return stream_file()
     if environ.get("REQUEST_METHOD") != "POST":
         return respond("405 Method Not Allowed", {"error": "Use POST"})
     connection = None

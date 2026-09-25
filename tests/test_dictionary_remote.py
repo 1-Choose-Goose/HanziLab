@@ -50,24 +50,8 @@ class RemoteDictionaryTests(unittest.TestCase):
         self.assertEqual(status, "200 OK")
         self.assertEqual(value, [{"hanzi": "学校"}])
 
-    def test_database_download_route_streams_sqlite_file(self):
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "hanzi.db"
-            path.write_bytes(b"SQLite format 3\x00payload")
-            status = []
-            env = {
-                "HTTP_AUTHORIZATION": "Bearer test",
-                "REQUEST_METHOD": "GET",
-                "PATH_INFO": "/v1/database",
-            }
-            with patch.dict(os.environ, HANZILAB_API_TOKEN="test"), patch.object(database, "DB_PATH", path):
-                result = dictionary_server.application(
-                    env, lambda value, headers: status.append((value, dict(headers)))
-                )
-                body = b"".join(result)
-            self.assertEqual(status[0][0], "200 OK")
-            self.assertEqual(status[0][1]["Content-Length"], str(len(body)))
-            self.assertTrue(body.startswith(b"SQLite format 3\x00"))
+    def test_server_does_not_distribute_database_file(self):
+        self.assertEqual(self.request({}, path="/v1/database", method="GET")[0], "405 Method Not Allowed")
 
     def test_download_is_validated_and_installed_atomically(self):
         class Response(io.BytesIO):
@@ -78,11 +62,35 @@ class RemoteDictionaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             destination = Path(folder) / "data" / "hanzi.db"
             response = Response(b"SQLite format 3\x00payload")
-            with patch.object(dictionary_remote, "configuration", return_value={"url": "https://example.test", "token": "test"}), patch.object(dictionary_remote, "urlopen", return_value=response):
+            config = {"download": {"provider": "yandex_disk", "public_url": "https://disk.yandex.ru/d/test", "password": "secret"}}
+            with patch.object(dictionary_remote, "configuration", return_value=config), patch.object(dictionary_remote, "_resolve_yandex_download", return_value="https://downloader.test/hanzi.db"), patch.object(dictionary_remote, "urlopen", return_value=response):
                 result = dictionary_remote.download_dictionary(destination)
             self.assertEqual(result, destination)
             self.assertEqual(destination.read_bytes(), b"SQLite format 3\x00payload")
             self.assertFalse(destination.with_name("hanzi.db.download").exists())
+
+    def test_download_resumes_an_existing_partial_file(self):
+        class Response(io.BytesIO):
+            status = 206
+
+            def __init__(self, value: bytes):
+                super().__init__(value)
+                self.headers = {"Content-Length": str(len(value))}
+
+        with tempfile.TemporaryDirectory() as folder:
+            destination = Path(folder) / "data" / "hanzi.db"
+            destination.parent.mkdir()
+            partial = destination.with_name("hanzi.db.download")
+            partial.write_bytes(b"SQLite format 3\x00part")
+            response = Response(b"ial")
+            config = {"download": {"provider": "yandex_disk", "public_url": "https://disk.yandex.ru/d/test", "password": "secret"}}
+            with patch.object(dictionary_remote, "configuration", return_value=config), patch.object(dictionary_remote, "_resolve_yandex_download", return_value="https://downloader.test/hanzi.db"), patch.object(dictionary_remote, "urlopen", return_value=response) as open_url:
+                dictionary_remote.download_dictionary(destination)
+            self.assertEqual(destination.read_bytes(), b"SQLite format 3\x00partial")
+            self.assertEqual(
+                open_url.call_args.args[0].get_header("Range"),
+                f"bytes={len(b'SQLite format 3') + 5}-",
+            )
 
     def test_json_requests_reuse_one_https_connection_per_worker(self):
         class Response:
