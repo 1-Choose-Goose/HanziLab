@@ -27,27 +27,33 @@ class MacOSSupportTests(unittest.TestCase):
                 root / "data",
             )
 
-    def test_frozen_macos_app_uses_adjacent_portable_data(self):
+    def test_frozen_macos_app_uses_user_application_support(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             executable = root / "Applications" / "HanziLab.app" / "Contents" / "MacOS" / "HanziLab"
             self.assertEqual(
                 default_user_data_dir(
-                    platform="darwin", frozen=True, executable=executable
+                    platform="darwin",
+                    home=root / "home",
+                    frozen=True,
+                    executable=executable,
                 ),
-                (root / "Applications" / "data").resolve(),
+                root / "home" / "Library" / "Application Support" / "HanziLab",
             )
 
-    def test_local_dist_build_reuses_project_data(self):
+    def test_local_dist_build_uses_user_application_support(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / "data").mkdir()
             executable = root / "dist" / "HanziLab.app" / "Contents" / "MacOS" / "HanziLab"
             self.assertEqual(
                 default_user_data_dir(
-                    platform="darwin", frozen=True, executable=executable
+                    platform="darwin",
+                    home=root / "home",
+                    frozen=True,
+                    executable=executable,
                 ),
-                (root / "data").resolve(),
+                root / "home" / "Library" / "Application Support" / "HanziLab",
             )
 
     def test_user_dictionary_precedes_bundled_dictionary(self):

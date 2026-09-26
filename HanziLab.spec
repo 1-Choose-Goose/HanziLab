@@ -16,6 +16,8 @@ a = Analysis(
         (str(PROJECT_ROOT / "assets" / "strokes"), "assets/strokes"),
         (str(PROJECT_ROOT / "assets" / "cursive"), "assets/cursive"),
         (str(PROJECT_ROOT / "data" / "hanzi-placeholder.db"), "data"),
+        (str(PROJECT_ROOT / "dictionary-server.json"), "."),
+        (str(PROJECT_ROOT / "dictionary-server-ca.pem"), "."),
     ],
     hiddenimports=[],
     hookspath=[],

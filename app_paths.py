@@ -38,20 +38,7 @@ def default_user_data_dir(
         return Path(override).expanduser().resolve()
     if platform == "darwin":
         if frozen:
-            executable = executable.resolve()
-            app_bundle = next(
-                (parent for parent in executable.parents if parent.suffix == ".app"),
-                None,
-            )
-            container = app_bundle.parent if app_bundle else executable.parent
-            # A local PyInstaller build lives in ``project/dist/HanziLab.app``.
-            # Reuse the project's existing data directory instead of copying a
-            # multi-gigabyte dictionary into dist. A moved/installed app uses a
-            # portable ``data`` directory alongside the .app bundle.
-            project_data = container.parent / "data"
-            if container.name == "dist" and project_data.is_dir():
-                return project_data
-            return container / "data"
+            return home / "Library" / "Application Support" / APP_NAME
         return source_root / "data"
     if platform == "win32":
         # Preserve the portable Windows layout used by existing releases.

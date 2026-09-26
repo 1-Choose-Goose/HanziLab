@@ -1595,6 +1595,18 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 
 def main() -> None:
     smoke_test = "--smoke-test" in sys.argv
+    server_check = "--server-check" in sys.argv
+    download_check = "--download-check" in sys.argv
+    if server_check:
+        if not dictionary_remote.enabled():
+            raise SystemExit("Server configuration is missing")
+        stats = dictionary_remote.call("stats")
+        if int(stats.get("entries", 0)) <= 0:
+            raise SystemExit("Dictionary server returned an empty database")
+        return
+    if download_check:
+        dictionary_remote.check_dictionary_download()
+        return
     if not smoke_test and not dictionary_remote.enabled() and not DB_PATH.exists():
         raise SystemExit("В комплекте приложения не найдена база HanziLab")
     app = QApplication(sys.argv)

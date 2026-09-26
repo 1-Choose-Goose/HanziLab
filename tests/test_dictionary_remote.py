@@ -12,6 +12,23 @@ import dictionary_server
 
 
 class RemoteDictionaryTests(unittest.TestCase):
+    def test_frozen_app_finds_configuration_in_bundled_resources(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            executable_root = root / "MacOS"
+            resource_root = root / "Frameworks"
+            resource_root.mkdir()
+            bundled_config = resource_root / "dictionary-server.json"
+            bundled_config.write_text("{}", encoding="utf-8")
+            with (
+                patch.object(dictionary_remote.sys, "frozen", True, create=True),
+                patch.object(dictionary_remote, "EXECUTABLE_ROOT", executable_root),
+                patch.object(dictionary_remote, "RESOURCE_ROOT", resource_root),
+            ):
+                self.assertEqual(
+                    dictionary_remote.configuration_path(), bundled_config
+                )
+
     def test_routes_all_dictionary_operations(self):
         with patch.object(dictionary_remote, "enabled", return_value=True), patch.object(dictionary_remote, "call", return_value=[]) as call:
             database.search_entries("学校")
@@ -90,6 +107,71 @@ class RemoteDictionaryTests(unittest.TestCase):
             self.assertEqual(
                 open_url.call_args.args[0].get_header("Range"),
                 f"bytes={len(b'SQLite format 3') + 5}-",
+            )
+
+    def test_download_reconnects_and_resumes_after_network_interruption(self):
+        first_part = b"SQLite format 3\x00part"
+        second_part = b"ial"
+        total = len(first_part) + len(second_part)
+
+        class InterruptedResponse(io.BytesIO):
+            status = 200
+
+            def __init__(self):
+                super().__init__(first_part)
+                self.headers = {"Content-Length": str(total)}
+                self.finished_data = False
+
+            def read(self, size=-1):
+                if self.finished_data:
+                    raise TimeoutError("connection interrupted")
+                value = super().read(size)
+                self.finished_data = True
+                return value
+
+        class ResumedResponse(io.BytesIO):
+            status = 206
+
+            def __init__(self):
+                super().__init__(second_part)
+                self.headers = {
+                    "Content-Length": str(len(second_part)),
+                    "Content-Range": (
+                        f"bytes {len(first_part)}-{total - 1}/{total}"
+                    ),
+                }
+
+        with tempfile.TemporaryDirectory() as folder:
+            destination = Path(folder) / "data" / "hanzi.db"
+            config = {
+                "download": {
+                    "provider": "yandex_disk",
+                    "public_url": "https://disk.yandex.ru/d/test",
+                    "password": "secret",
+                }
+            }
+            with (
+                patch.object(dictionary_remote, "configuration", return_value=config),
+                patch.object(
+                    dictionary_remote,
+                    "_resolve_yandex_download",
+                    return_value="https://downloader.test/hanzi.db",
+                ) as resolve,
+                patch.object(
+                    dictionary_remote,
+                    "urlopen",
+                    side_effect=[InterruptedResponse(), ResumedResponse()],
+                ) as open_url,
+                patch.object(dictionary_remote.time, "sleep"),
+            ):
+                dictionary_remote.download_dictionary(destination)
+
+            self.assertEqual(destination.read_bytes(), first_part + second_part)
+            self.assertEqual(resolve.call_count, 2)
+            self.assertEqual(open_url.call_count, 2)
+            self.assertEqual(
+                open_url.call_args_list[1].args[0].get_header("Range"),
+                f"bytes={len(first_part)}-",
             )
 
     def test_json_requests_reuse_one_https_connection_per_worker(self):

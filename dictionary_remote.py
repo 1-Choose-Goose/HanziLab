@@ -8,6 +8,7 @@ import shutil
 import ssl
 import sys
 import threading
+import time
 from functools import lru_cache
 from http.client import HTTPException, HTTPSConnection
 from http.cookiejar import CookieJar
@@ -22,8 +23,26 @@ from urllib.request import (
     urlopen,
 )
 
-ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+import certifi
+
+from app_paths import RESOURCE_ROOT
+
+
+SOURCE_ROOT = Path(__file__).resolve().parent
+EXECUTABLE_ROOT = Path(sys.executable).resolve().parent
 _THREAD_CONNECTION = threading.local()
+
+
+def configuration_path() -> Path:
+    roots = (
+        (EXECUTABLE_ROOT, RESOURCE_ROOT)
+        if getattr(sys, "frozen", False)
+        else (SOURCE_ROOT,)
+    )
+    return next(
+        (root / "dictionary-server.json" for root in roots if (root / "dictionary-server.json").is_file()),
+        roots[0] / "dictionary-server.json",
+    )
 
 
 @lru_cache(maxsize=1)
@@ -34,13 +53,13 @@ def _load_configuration(path: Path) -> dict:
 def configuration() -> dict:
     if os.environ.get("HANZILAB_DICTIONARY_LOCAL") == "1":
         return {}
-    path = ROOT / "dictionary-server.json"
+    path = configuration_path()
     return _load_configuration(path) if path.exists() else {}
 
 
 @lru_cache(maxsize=2)
 def _ssl_context(ca_file: str) -> ssl.SSLContext:
-    return ssl.create_default_context(cafile=ca_file or None)
+    return ssl.create_default_context(cafile=ca_file or certifi.where())
 
 
 def enabled() -> bool:
@@ -84,7 +103,11 @@ def call(operation: str, **parameters):
     url = config["url"].rstrip("/")
     if not url.startswith("https://"):
         raise RuntimeError("Сервер словаря должен использовать HTTPS")
-    ca_file = str(ROOT / config["ca_file"]) if config.get("ca_file") else ""
+    ca_file = (
+        str(configuration_path().parent / config["ca_file"])
+        if config.get("ca_file")
+        else ""
+    )
     context = _ssl_context(ca_file)
     for attempt in range(2):
         try:
@@ -170,49 +193,106 @@ def download_dictionary(destination: Path, progress=None, cancelled=None) -> Pat
     password = download.get("password", "")
     if download.get("provider") != "yandex_disk" or not public_url or not password:
         raise RuntimeError("Источник загрузки словаря не настроен")
-    context = _ssl_context("")
-    try:
-        download_url = _resolve_yandex_download(public_url, password, context)
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
-        raise RuntimeError("Не удалось получить файл с Яндекс Диска. Повторите попытку позже.") from error
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".download")
-    offset = temporary.stat().st_size if temporary.exists() else 0
-    headers = {"User-Agent": "HanziLab"}
-    if offset:
-        headers["Range"] = f"bytes={offset}-"
-    request = Request(download_url, headers=headers)
+    context = _ssl_context("")
+    last_error: Exception | None = None
+
+    for attempt in range(10):
+        if cancelled and cancelled():
+            raise RuntimeError("Загрузка отменена")
+        offset = temporary.stat().st_size if temporary.exists() else 0
+        try:
+            # Yandex download links are short-lived. Resolve a fresh one for
+            # every reconnect, then continue from the last byte on disk.
+            download_url = _resolve_yandex_download(public_url, password, context)
+            headers = {"User-Agent": "HanziLab"}
+            if offset:
+                headers["Range"] = f"bytes={offset}-"
+            request = Request(download_url, headers=headers)
+            with urlopen(request, timeout=120, context=context) as response:
+                partial = bool(
+                    offset and getattr(response, "status", 200) == 206
+                )
+                if not partial:
+                    offset = 0
+                remaining = int(response.headers.get("Content-Length") or 0)
+                content_range = response.headers.get("Content-Range", "")
+                range_total = re.search(r"/(\d+)$", content_range)
+                total = (
+                    int(range_total.group(1))
+                    if range_total
+                    else offset + remaining if remaining else 0
+                )
+                needed = max(total - offset, remaining)
+                if needed and shutil.disk_usage(destination.parent).free < needed + 256 * 1024 * 1024:
+                    raise RuntimeError(
+                        "Недостаточно места: для локального словаря нужно около 2,5 ГБ."
+                    )
+                downloaded = offset
+                with temporary.open("ab" if partial else "wb") as stream:
+                    while True:
+                        if cancelled and cancelled():
+                            raise RuntimeError("Загрузка отменена")
+                        block = response.read(2 * 1024 * 1024)
+                        if not block:
+                            break
+                        stream.write(block)
+                        downloaded += len(block)
+                        if progress and total:
+                            progress(downloaded, total)
+            if total and temporary.stat().st_size != total:
+                raise OSError("Файл словаря загружен не полностью")
+            with temporary.open("rb") as stream:
+                if stream.read(16) != b"SQLite format 3\x00":
+                    temporary.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        "Яндекс Диск вернул повреждённый файл словаря."
+                    )
+            temporary.replace(destination)
+            return destination
+        except RuntimeError as error:
+            if str(error) in {
+                "Загрузка отменена",
+                "Недостаточно места: для локального словаря нужно около 2,5 ГБ.",
+                "Яндекс Диск вернул повреждённый файл словаря.",
+            }:
+                raise
+            last_error = error
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
+            last_error = error
+
+        if attempt < 9:
+            delay = min(2 ** attempt, 15)
+            for _ in range(delay * 4):
+                if cancelled and cancelled():
+                    raise RuntimeError("Загрузка отменена")
+                time.sleep(0.25)
+
+    raise RuntimeError(
+        "Загрузка несколько раз прервалась. Уже скачанная часть сохранена — повторите попытку позже."
+    ) from last_error
+
+
+def check_dictionary_download() -> None:
+    """Verify credentials and the SQLite header without downloading the database."""
+    config = configuration()
+    download = config.get("download") or {}
+    public_url = download.get("public_url", "")
+    password = download.get("password", "")
+    if download.get("provider") != "yandex_disk" or not public_url or not password:
+        raise RuntimeError("Источник загрузки словаря не настроен")
+    context = _ssl_context("")
+    download_url = _resolve_yandex_download(public_url, password, context)
+    request = Request(
+        download_url,
+        headers={"User-Agent": "HanziLab", "Range": "bytes=0-15"},
+    )
     try:
         with urlopen(request, timeout=30, context=context) as response:
-            partial = offset and getattr(response, "status", 200) == 206
-            if not partial:
-                offset = 0
-            remaining = int(response.headers.get("Content-Length") or 0)
-            total = offset + remaining if remaining else 0
-            if remaining and shutil.disk_usage(destination.parent).free < remaining + 256 * 1024 * 1024:
-                raise RuntimeError("Недостаточно места: для локального словаря нужно около 2,5 ГБ.")
-            downloaded = offset
-            with temporary.open("ab" if partial else "wb") as stream:
-                while True:
-                    if cancelled and cancelled():
-                        raise RuntimeError("Загрузка отменена")
-                    block = response.read(2 * 1024 * 1024)
-                    if not block:
-                        break
-                    stream.write(block)
-                    downloaded += len(block)
-                    if progress and total:
-                        progress(downloaded, total)
-        if total and temporary.stat().st_size != total:
-            raise RuntimeError("Файл словаря загружен не полностью.")
-        with temporary.open("rb") as stream:
-            if stream.read(16) != b"SQLite format 3\x00":
+            if response.read(16) != b"SQLite format 3\x00":
                 raise RuntimeError("Яндекс Диск вернул повреждённый файл словаря.")
-        temporary.replace(destination)
-        return destination
-    except RuntimeError as error:
-        if "повреждённый" in str(error) or "не полностью" in str(error):
-            temporary.unlink(missing_ok=True)
-        raise
-    except (URLError, TimeoutError, OSError, ValueError) as error:
-        raise RuntimeError("Не удалось скачать словарь с Яндекс Диска. Проверьте интернет и свободное место.") from error
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
+        raise RuntimeError(
+            "Не удалось проверить словарь на Яндекс Диске."
+        ) from error

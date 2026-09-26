@@ -8,6 +8,13 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
+for required_file in dictionary-server.json dictionary-server-ca.pem; do
+  if [[ ! -s "$required_file" ]]; then
+    echo "Missing required server configuration: $required_file" >&2
+    exit 1
+  fi
+done
+
 ICON="assets/icons/hanzilab.icns"
 # Recent macOS releases can reject otherwise valid hand-built iconsets. Let
 # the system image service create the ICNS container directly instead.
@@ -19,6 +26,8 @@ APP="dist/HanziLab.app"
 [[ -d "$APP" ]] || { echo "Build completed without $APP" >&2; exit 1; }
 
 "$APP/Contents/MacOS/HanziLab" --smoke-test
+"$APP/Contents/MacOS/HanziLab" --server-check
+"$APP/Contents/MacOS/HanziLab" --download-check
 
 SIGNING_IDENTITY="${MACOS_SIGNING_IDENTITY:--}"
 if [[ "$SIGNING_IDENTITY" == "-" ]]; then
