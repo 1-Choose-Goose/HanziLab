@@ -2,3 +2,4 @@ PySide6>=6.8,<7
 numpy>=2.0,<3
 pypinyin>=0.55,<1
 certifi>=2024.2.2,<2027
+genanki==0.13.1

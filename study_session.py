@@ -6,9 +6,12 @@ from datetime import datetime
 from typing import Protocol
 
 from scheduler import (
+    DEFAULT_CONFIG,
     CardState,
     Rating,
     ReviewDirection,
+    SchedulerConfig,
+    calculate_retrievability,
     ensure_aware,
     parse_datetime,
     schedule_rating,
@@ -45,10 +48,13 @@ def choose_direction(rng: RandomSource = random) -> ReviewDirection:
 
 def _is_available(card: CardState, now: datetime) -> bool:
     return (
-        card.priority_boost
-        or card.learning_state.value == "NEW"
-        or card.next_review_at is None
-        or ensure_aware(card.next_review_at) <= now
+        not card.is_suspended
+        and (
+            card.priority_boost
+            or card.learning_state.value == "NEW"
+            or card.next_review_at is None
+            or ensure_aware(card.next_review_at) <= now
+        )
     )
 
 
@@ -58,6 +64,8 @@ def select_daily_cards(
     daily_limit: int,
     now: datetime,
     rng: RandomSource = random,
+    new_limit: int | None = None,
+    config: SchedulerConfig = DEFAULT_CONFIG,
 ) -> list[DailySelection]:
     """Сначала выбирает незавершённые учебные и NEW, затем обычные due."""
     remaining = max(0, int(daily_limit) - len(existing_card_ids))
@@ -75,8 +83,8 @@ def select_daily_cards(
         card
         for card in available
         if card.priority_boost
-        or card.learning_state.value == "NEW"
         or card.learning_state.value == "LEARNING"
+        if card.learning_state.value != "NEW"
     ]
     priority_learning.sort(
         key=lambda card: (
@@ -94,36 +102,53 @@ def select_daily_cards(
     priority_selected = priority_learning[:remaining]
     remaining -= len(priority_selected)
 
+    new = [card for card in available if card.learning_state.value == "NEW"]
+    new.sort(key=lambda card: (0 if card.priority_boost else 1, card.id))
+    allowed_new = remaining if new_limit is None else min(remaining, max(0, new_limit))
+    new_selected = new[:allowed_new]
+
     due = [
         card
         for card in available
         if not card.priority_boost
         and card.learning_state.value not in {"NEW", "LEARNING"}
     ]
-    due.sort(
-        key=lambda card: (
-            ensure_aware(card.next_review_at).timestamp()
-            if card.next_review_at is not None
-            else float("-inf"),
-            card.id,
+    if config.review_order == "retrievability":
+        due.sort(key=lambda card: (calculate_retrievability(card, now, config), card.id))
+    else:
+        due.sort(
+            key=lambda card: (
+                ensure_aware(card.next_review_at).timestamp()
+                if card.next_review_at is not None
+                else float("-inf"),
+                card.id,
+            )
         )
-    )
-    due_selected = due[:remaining]
     # Каждая группа перемешивается отдельно, сохраняя порядок приоритетов.
     boosted_selected = [card for card in priority_selected if card.priority_boost]
     learning_selected = [
         card for card in priority_selected
         if not card.priority_boost and card.learning_state.value == "LEARNING"
     ]
-    new_selected = [
-        card for card in priority_selected
-        if not card.priority_boost and card.learning_state.value == "NEW"
-    ]
     rng.shuffle(boosted_selected)
     rng.shuffle(learning_selected)
-    rng.shuffle(new_selected)
-    rng.shuffle(due_selected)
-    selected = boosted_selected + learning_selected + new_selected + due_selected
+    if config.new_card_order == "random":
+        rng.shuffle(new_selected)
+    if config.review_order == "random":
+        rng.shuffle(due)
+    if config.new_review_order == "reviews_first":
+        normal_candidates = due + new_selected
+    elif config.new_review_order == "mix":
+        normal_candidates = []
+        for index in range(max(len(new_selected), len(due))):
+            if index < len(due):
+                normal_candidates.append(due[index])
+            if index < len(new_selected):
+                normal_candidates.append(new_selected[index])
+    else:
+        normal_candidates = new_selected + due
+    normal_selected = normal_candidates[:remaining]
+    selected = boosted_selected + learning_selected + normal_selected
     return [DailySelection(card.id, choose_direction(rng)) for card in selected]
 
 
@@ -186,9 +211,22 @@ class StudySessionService:
         if len(existing_ids) >= limit:
             return
         remaining = limit - len(existing_ids)
-        candidates = self.repository.get_daily_candidates(date_key, now, remaining)
+        new_remaining = max(
+            0,
+            self.repository.get_new_cards_limit()
+            - self.repository.get_daily_new_count(date_key),
+        )
+        candidates = self.repository.get_daily_candidates(
+            date_key, now, remaining, new_remaining
+        )
         selections = select_daily_cards(
-            candidates, set(), remaining, now, self.rng
+            candidates,
+            set(),
+            remaining,
+            now,
+            self.rng,
+            new_remaining,
+            self.repository.get_scheduler_config(),
         )
         rows = [
             (selection.card_id, selection.direction.value, start_position + index)
@@ -199,8 +237,18 @@ class StudySessionService:
     def can_continue(self, now: datetime) -> bool:
         """Whether another due/new logical card can be added without moving its due date."""
         self.ensure_daily_session(now)
+        date_key = local_date(now)
         return bool(
-            self.repository.get_daily_candidates(local_date(now), now, 1)
+            self.repository.get_daily_candidates(
+                date_key,
+                now,
+                1,
+                max(
+                    0,
+                    self.repository.get_new_cards_limit()
+                    - self.repository.get_daily_new_count(date_key),
+                ),
+            )
         )
 
     def continue_daily_session(self, now: datetime) -> int:
@@ -211,10 +259,28 @@ class StudySessionService:
         existing_ids = {int(row["card_id"]) for row in existing}
         batch_size = self.repository.get_daily_limit()
         candidates = self.repository.get_daily_candidates(
-            date_key, now, batch_size
+            date_key,
+            now,
+            batch_size,
+            max(
+                0,
+                self.repository.get_new_cards_limit()
+                - self.repository.get_daily_new_count(date_key),
+            ),
+        )
+        new_remaining = max(
+            0,
+            self.repository.get_new_cards_limit()
+            - self.repository.get_daily_new_count(date_key),
         )
         selections = select_daily_cards(
-            candidates, set(), batch_size, now, self.rng
+            candidates,
+            set(),
+            batch_size,
+            now,
+            self.rng,
+            new_remaining,
+            self.repository.get_scheduler_config(),
         )
         if not selections:
             return 0
@@ -307,7 +373,9 @@ class StudySessionService:
         current = self.repository.get_card(item.card.id)
         if current is None:
             raise LookupError(f"Карточка {item.card.id} не найдена")
-        outcome = schedule_rating(current, rating, reviewed_at)
+        outcome = schedule_rating(
+            current, rating, reviewed_at, self.repository.get_scheduler_config()
+        )
         pair_matches = self.repository.save_review(
             current,
             outcome,

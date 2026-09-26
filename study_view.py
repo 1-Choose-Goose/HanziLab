@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -10,11 +11,14 @@ from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
-    QApplication,
+    QComboBox,
     QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -23,22 +27,31 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QStackedWidget,
+    QStyle,
+    QStyleOptionComboBox,
+    QStylePainter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from anki_export import export_anki_package
 from anki_import import parse_anki_export
 from card_widgets import RevealPinyinButton
 from database import get_entries_by_hanzi
 from scheduler import (
+    DEFAULT_CONFIG,
+    FSRS6_DEFAULT_PARAMETERS,
     Rating,
     ReviewDirection,
     format_interval,
+    interval_for_stability,
     preview_ratings,
+    validate_config,
 )
 from study_database import StudyRepository, utc_now
 from study_session import SessionItem, StudySessionService
@@ -61,6 +74,53 @@ RATING_LABELS = {
     Rating.MEDIUM: "Средне",
     Rating.EASY: "Легко",
 }
+
+
+class NoWheelComboBox(QComboBox):
+    """Let a surrounding scroll area handle the wheel while the popup is closed."""
+
+    def wheelEvent(self, event) -> None:
+        if self.view().isVisible():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class CenteredNoWheelComboBox(NoWheelComboBox):
+    """Draw the selected value in the center while keeping the arrow separate."""
+
+    def paintEvent(self, event) -> None:
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        painter = QStylePainter(self)
+        painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, option)
+        text_rect = self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox,
+            option,
+            QStyle.SubControl.SC_ComboBoxEditField,
+            self,
+        )
+        painter.setPen(option.palette.text().color())
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextSingleLine,
+            option.currentText,
+        )
+
+
+class NoWheelSpinBox(QSpinBox):
+    """Let the settings page scroll without changing a numeric value."""
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """Let the settings page scroll without changing a numeric value."""
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
 
 INPUT_KAITI_FAMILY = "HanziLab KaiTi CJK"
 
@@ -111,11 +171,11 @@ class ManualCardDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self.repository = repository
         self.setObjectName("manualCardDialog")
         self.setWindowTitle("Новая карточка")
         self.setModal(True)
         self.setMinimumWidth(470)
-        self.repository = repository
         self.lookup_generation = 0
         self.lookup_tasks: set[DictionaryLookupTask] = set()
         self.lookup_timer = QTimer(self)
@@ -423,6 +483,649 @@ class ExampleLoadTask(QRunnable):
         self.signals.finished.emit(self.generation, self.key, examples, error)
 
 
+class SpacedRepetitionSettingsDialog(QDialog):
+    """User-facing FSRS controls; model weights stay available but deliberately advanced."""
+
+    def __init__(self, repository: StudyRepository, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.repository = repository
+        self.config = repository.get_scheduler_config()
+        self.setObjectName("spacedRepetitionSettingsDialog")
+        self.setWindowTitle("Настройки интервального повторения")
+        self.resize(860, 760)
+        self.setMinimumSize(700, 580)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 22)
+        root.setSpacing(16)
+        title = QLabel("Настройки повторения")
+        title.setObjectName("settingsDialogTitle")
+        intro = QLabel(
+            "Управляйте дневной нагрузкой, первичным обучением и расписанием FSRS. "
+            "Рекомендуемые значения уже выбраны — менять всё сразу не требуется."
+        )
+        intro.setObjectName("settingsDialogHint")
+        intro.setWordWrap(True)
+        root.addWidget(title)
+        root.addWidget(intro)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("schedulerSettingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("schedulerSettingsContent")
+        sections = QVBoxLayout(content)
+        sections.setContentsMargins(0, 0, 8, 0)
+        sections.setSpacing(14)
+        scroll.setWidget(content)
+        root.addWidget(scroll, 1)
+
+        daily = self._section(
+            "Дневные лимиты",
+            "Задайте, сколько карточек программа подготовит на один учебный день.",
+        )
+        sections.addWidget(daily)
+        daily_layout = daily.layout()
+        self.daily_limit = NoWheelSpinBox()
+        self._prepare_spinbox(self.daily_limit)
+        self.daily_limit.setObjectName("settingsDailyLimit")
+        self.daily_limit.setRange(1, 1000)
+        self.daily_limit.setSuffix(" карточек")
+        self.daily_limit.setValue(repository.get_daily_limit())
+        daily_layout.addWidget(self._setting_row(
+            "Максимум повторений в день",
+            "Общее число карточек на сегодня: сюда входят и новые слова, и ранее изученные. Уже начатое повторение не прерывается.",
+            self.daily_limit,
+        ))
+        self.new_cards_limit = NoWheelSpinBox()
+        self._prepare_spinbox(self.new_cards_limit)
+        self.new_cards_limit.setObjectName("newCardsPerDay")
+        self.new_cards_limit.setRange(0, 1000)
+        self.new_cards_limit.setSuffix(" карточек")
+        self.new_cards_limit.setValue(repository.get_new_cards_limit())
+        daily_layout.addWidget(self._setting_row(
+            "Новых карточек в день",
+            "Сколько ещё не изучавшихся слов можно впервые показать сегодня. Значение 0 оставит только повторения.",
+            self.new_cards_limit,
+        ))
+
+        order = self._section(
+            "Порядок показа",
+            "Выберите, в какой последовательности карточки будут появляться во время занятия.",
+        )
+        order_layout = order.layout()
+        self.new_review_order = NoWheelComboBox()
+        self.new_review_order.setObjectName("newReviewOrder")
+        self._fill_combo(self.new_review_order, (
+            ("Сначала новые", "new_first"),
+            ("Сначала повторения", "reviews_first"),
+            ("Перемешивать", "mix"),
+        ), self.config.new_review_order)
+        order_layout.addWidget(self._setting_row(
+            "Новые и повторяемые",
+            "Показывать незнакомые слова до повторений, после них или чередовать оба типа.",
+            self.new_review_order,
+        ))
+        self.new_card_order = NoWheelComboBox()
+        self.new_card_order.setObjectName("newCardOrder")
+        self._fill_combo(self.new_card_order, (
+            ("В случайном порядке", "random"),
+            ("Сначала добавленные раньше", "added"),
+        ), self.config.new_card_order)
+        order_layout.addWidget(self._setting_row(
+            "Порядок новых карточек",
+            "«Случайно» перемешивает новые слова. «Сначала добавленные раньше» сохраняет очередь по дате добавления.",
+            self.new_card_order,
+        ))
+        self.review_order = NoWheelComboBox()
+        self.review_order.setObjectName("reviewOrder")
+        self._fill_combo(self.review_order, (
+            ("Сначала самые просроченные", "due"),
+            ("Сначала хуже запоминаемые", "retrievability"),
+            ("Полностью случайно", "random"),
+        ), self.config.review_order)
+        order_layout.addWidget(self._setting_row(
+            "Порядок повторений",
+            "«Просроченные» показывает сначала карточки, срок которых прошёл раньше. «Хуже запоминаемые» начинает с самых трудных для памяти.",
+            self.review_order,
+        ))
+
+        learning = self._section(
+            "Новые карточки",
+            "При первом изучении слово показывается несколько раз с короткими паузами. После последнего успешного ответа начинается обычное расписание.",
+        )
+        sections.addWidget(learning)
+        learning_layout = learning.layout()
+        self.learning_steps = QLineEdit(
+            self._format_steps(self.config.learning_steps_seconds)
+        )
+        self.learning_steps.setObjectName("learningSteps")
+        self.learning_steps.setPlaceholderText("например: 2 минуты; 10 минут")
+        learning_layout.addWidget(self._setting_row(
+            "Паузы при первом изучении",
+            "Каждое значение — время до следующего короткого показа. «2 минуты; 10 минут» означает: сначала повторить через 2 минуты, затем через 10 минут.",
+            self.learning_steps,
+        ))
+        lapse = self._section(
+            "Забыто",
+            "Настройки для случая, когда ранее изученное слово совсем не удалось вспомнить.",
+        )
+        sections.addWidget(lapse)
+        lapse_layout = lapse.layout()
+        self.relearning_steps = QLineEdit(
+            self._format_steps(self.config.relearning_steps_seconds)
+        )
+        self.relearning_steps.setObjectName("relearningSteps")
+        self.relearning_steps.setPlaceholderText("например: 10 минут; пусто — без паузы")
+        lapse_layout.addWidget(self._setting_row(
+            "Паузы после полного забывания",
+            "После ответа «Очень тяжело» карточка снова появится через указанное время. Если поле пустое, сразу будет назначена следующая дата в календаре.",
+            self.relearning_steps,
+        ))
+        self.leech_threshold = NoWheelSpinBox()
+        self._prepare_spinbox(self.leech_threshold)
+        self.leech_threshold.setObjectName("leechThreshold")
+        self.leech_threshold.setRange(0, 100)
+        self.leech_threshold.setSpecialValueText("Отключено")
+        self.leech_threshold.setSuffix(" ошибок")
+        self.leech_threshold.setValue(self.config.leech_threshold)
+        lapse_layout.addWidget(self._setting_row(
+            "Порог трудной карточки",
+            "После указанного числа ответов «Очень тяжело» карточка будет считаться проблемной. Значение 0 отключает эту проверку.",
+            self.leech_threshold,
+        ))
+        self.leech_action = NoWheelComboBox()
+        self.leech_action.setObjectName("leechAction")
+        self._fill_combo(self.leech_action, (
+            ("Только отметить", "tag_only"),
+            ("Приостановить", "suspend"),
+        ), self.config.leech_action)
+        lapse_layout.addWidget(self._setting_row(
+            "Что делать с трудной карточкой",
+            "«Только отметить» оставит её в занятиях. «Приостановить» уберёт из очереди, пока вы не вернёте её через список карточек.",
+            self.leech_action,
+        ))
+
+        sections.addWidget(order)
+
+        fsrs = self._section(
+            "FSRS 6",
+            "Алгоритм оценивает, когда слово начнёт забываться, и назначает следующую дату повторения.",
+        )
+        fsrs.setObjectName("fsrsSettingsSection")
+        sections.addWidget(fsrs)
+        fsrs_layout = fsrs.layout()
+        self.preset = NoWheelComboBox()
+        self.preset.setObjectName("schedulerPreset")
+        self._prepare_combo(self.preset)
+        self.preset.addItems(("Сбалансированно · 90%", "Надёжно · 95%", "Меньше нагрузки · 85%", "Свои настройки"))
+        fsrs_layout.addWidget(self._setting_row(
+            "Предустановка",
+            "Быстрый выбор между обычной нагрузкой, более надёжным запоминанием и более редкими занятиями.",
+            self.preset,
+        ))
+        self.retention = NoWheelSpinBox()
+        self._prepare_spinbox(self.retention)
+        self.retention.setObjectName("desiredRetention")
+        self.retention.setRange(70, 97)
+        self.retention.setSuffix(" %")
+        self.retention.setValue(round(self.config.desired_retention * 100))
+        self.retention_effect = QLabel()
+        self.retention_effect.setObjectName("retentionEffect")
+        retention_control = QWidget()
+        retention_control.setObjectName("inlineSettingControl")
+        retention_layout = QVBoxLayout(retention_control)
+        retention_layout.setContentsMargins(0, 0, 0, 0)
+        retention_layout.setSpacing(4)
+        retention_layout.addWidget(self.retention)
+        retention_layout.addWidget(self.retention_effect)
+        fsrs_layout.addWidget(self._setting_row(
+            "Желаемое усвоение",
+            "Ожидаемая доля правильных ответов: 90% означает примерно 90 успешных ответов из 100. Чем выше процент, тем чаще повторения.",
+            retention_control,
+        ))
+        self.retention_warning = QLabel()
+        self.retention_warning.setObjectName("retentionWarning")
+        self.retention_warning.setWordWrap(True)
+        fsrs_layout.addWidget(self.retention_warning)
+        rating_hint = QLabel(
+            "Важно: если ответ не вспомнился, выбирайте «Очень тяжело». «Тяжело» — "
+            "успешный ответ с большим усилием. Это различие влияет на расчёт памяти."
+        )
+        rating_hint.setObjectName("schedulerInfoCallout")
+        rating_hint.setWordWrap(True)
+        fsrs_layout.addWidget(rating_hint)
+
+        easy_days_section = self._section(
+            "Лёгкие дни",
+            "Можно заранее уменьшить число будущих повторений в дни, когда у вас меньше времени.",
+        )
+        sections.addWidget(easy_days_section)
+        easy_days_section_layout = easy_days_section.layout()
+
+        advanced = self._section(
+            "Дополнительные",
+            "Ограничения расписания. Если вы не уверены, оставьте значения по умолчанию.",
+        )
+        sections.addWidget(advanced)
+        advanced_layout = advanced.layout()
+        self.maximum_interval = NoWheelSpinBox()
+        self._prepare_spinbox(self.maximum_interval)
+        self.maximum_interval.setObjectName("maximumReviewInterval")
+        self.maximum_interval.setRange(1, 36500)
+        self.maximum_interval.setSuffix(" дней")
+        self.maximum_interval.setValue(round(self.config.maximum_interval_days))
+        advanced_layout.addWidget(self._setting_row(
+            "Максимальный интервал",
+            "Самая длинная разрешённая пауза между двумя повторениями одной карточки. Обычно это ограничение менять не нужно.",
+            self.maximum_interval,
+        ))
+        self.minimum_interval = NoWheelDoubleSpinBox()
+        self._prepare_spinbox(self.minimum_interval)
+        self.minimum_interval.setRange(0.1, 30.0)
+        self.minimum_interval.setDecimals(1)
+        self.minimum_interval.setSuffix(" дней")
+        self.minimum_interval.setValue(self.config.minimum_review_interval_days)
+        advanced_layout.addWidget(self._setting_row(
+            "Минимальный дневной интервал",
+            "Самая короткая пауза в календарных днях после завершения начального обучения. К минутным паузам выше не относится.",
+            self.minimum_interval,
+        ))
+        self.fuzzing = QPushButton()
+        self.fuzzing.setObjectName("enableIntervalFuzzing")
+        self._prepare_toggle(self.fuzzing)
+        self.fuzzing.setChecked(self.config.enable_fuzzing)
+        advanced_layout.addWidget(self._setting_row(
+            "Разброс интервалов",
+            "Слегка сдвигает повторения на соседние дни, чтобы слишком много карточек не собиралось на одну дату.",
+            self.fuzzing,
+        ))
+        easy_days = QWidget()
+        easy_days.setObjectName("easyDaysControl")
+        easy_days_layout = QVBoxLayout(easy_days)
+        easy_days_layout.setContentsMargins(0, 11, 0, 11)
+        easy_days_layout.setSpacing(7)
+        easy_days_title = QLabel("Нагрузка по дням недели")
+        easy_days_title.setObjectName("schedulerSettingTitle")
+        easy_days_hint = QLabel(
+            "«Обычно» не снижает нагрузку, «Легче» старается назначать меньше карточек, "
+            "а «Минимум» по возможности избегает этого дня. Уже просроченные карточки не переносятся."
+        )
+        easy_days_hint.setObjectName("schedulerSettingDescription")
+        easy_days_hint.setWordWrap(True)
+        easy_days_grid = QGridLayout()
+        easy_days_grid.setContentsMargins(0, 3, 0, 0)
+        easy_days_grid.setHorizontalSpacing(8)
+        self.easy_day_controls = []
+        for index, (day, value) in enumerate(zip(
+            ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"),
+            self.config.easy_days_percentages,
+        )):
+            grid_column = (index % 4) * 2 + (1 if index >= 4 else 0)
+            grid_row = (index // 4) * 2
+            label = QLabel(day)
+            label.setObjectName("easyDayLabel")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            combo = CenteredNoWheelComboBox()
+            combo.setObjectName("easyDayLoad")
+            self._prepare_combo(combo)
+            combo.addItem("Обычно", 1.0)
+            combo.addItem("Легче", 0.5)
+            combo.addItem("Минимум", 0.1)
+            combo.setCurrentIndex(max(0, combo.findData(value)))
+            combo.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+            )
+            self.easy_day_controls.append(combo)
+            easy_days_grid.addWidget(label, grid_row, grid_column, 1, 2)
+            easy_days_grid.addWidget(combo, grid_row + 1, grid_column, 1, 2)
+        for column in range(8):
+            easy_days_grid.setColumnStretch(column, 1)
+        easy_days_layout.addWidget(easy_days_title)
+        easy_days_layout.addWidget(easy_days_hint)
+        easy_days_layout.addLayout(easy_days_grid)
+        easy_days_section_layout.addWidget(easy_days)
+        self.reschedule = QPushButton()
+        self.reschedule.setObjectName("rescheduleOnSettingsChange")
+        self._prepare_toggle(self.reschedule)
+        self.reschedule.setChecked(True)
+        advanced_layout.addWidget(self._setting_row(
+            "Применить изменения сейчас",
+            "Если включено, даты уже изученных карточек будут пересчитаны сразу. Если выключено — каждая карточка получит новые правила после следующего ответа.",
+            self.reschedule,
+        ))
+
+        parameters_toggle = QPushButton("Экспертные параметры алгоритма")
+        parameters_toggle.setObjectName("parametersToggle")
+        parameters_toggle.setCheckable(True)
+        advanced_layout.addWidget(parameters_toggle, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.parameters_panel = QFrame()
+        self.parameters_panel.setObjectName("parametersPanel")
+        parameters_layout = QVBoxLayout(self.parameters_panel)
+        parameters_layout.setContentsMargins(14, 12, 14, 14)
+        parameters_hint = QLabel(
+            "Это коэффициенты модели, а не интервалы. Не копируйте чужие значения: "
+            "они меняют внутренние расчёты памяти. Если вы специально их не настраивали, оставьте значения по умолчанию."
+        )
+        parameters_hint.setObjectName("settingsDialogHint")
+        parameters_hint.setWordWrap(True)
+        self.parameters = QPlainTextEdit()
+        self.parameters.setObjectName("fsrsParameters")
+        self.parameters.setPlainText(self._format_parameters(self.config.fsrs_parameters))
+        self.parameters.setMaximumHeight(110)
+        reset_parameters = QPushButton("Вернуть параметры FSRS по умолчанию")
+        reset_parameters.setObjectName("resetFsrsParameters")
+        reset_parameters.clicked.connect(
+            lambda: self.parameters.setPlainText(
+                self._format_parameters(FSRS6_DEFAULT_PARAMETERS)
+            )
+        )
+        parameters_layout.addWidget(parameters_hint)
+        parameters_layout.addWidget(self.parameters)
+        parameters_layout.addWidget(reset_parameters, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.parameters_panel.setVisible(False)
+        parameters_toggle.toggled.connect(self.parameters_panel.setVisible)
+        parameters_toggle.toggled.connect(
+            lambda visible: parameters_toggle.setText(
+                "Скрыть экспертные параметры" if visible else "Экспертные параметры алгоритма"
+            )
+        )
+        advanced_layout.addWidget(self.parameters_panel)
+        sections.addStretch()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.RestoreDefaults
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).setText("По умолчанию")
+        buttons.button(QDialogButtonBox.StandardButton.Save).setObjectName(
+            "schedulerSettingsSave"
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setObjectName(
+            "schedulerSettingsCancel"
+        )
+        buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).setObjectName(
+            "schedulerSettingsDefaults"
+        )
+        buttons.accepted.connect(self.save)
+        buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(
+            self.restore_defaults
+        )
+        root.addWidget(buttons)
+
+        self.preset.currentIndexChanged.connect(self.apply_preset)
+        self.retention.valueChanged.connect(self.retention_changed)
+        self.retention_changed(self.retention.value())
+        if self.retention.value() == 90:
+            self.preset.setCurrentIndex(0)
+        elif self.retention.value() == 95:
+            self.preset.setCurrentIndex(1)
+        elif self.retention.value() == 85:
+            self.preset.setCurrentIndex(2)
+        else:
+            self.preset.setCurrentIndex(3)
+
+    @staticmethod
+    def _section(title: str, subtitle: str) -> QFrame:
+        section = QFrame()
+        section.setObjectName("schedulerSettingsSection")
+        layout = QVBoxLayout(section)
+        layout.setContentsMargins(20, 17, 20, 18)
+        layout.setSpacing(0)
+        heading = QLabel(title)
+        heading.setObjectName("schedulerSectionTitle")
+        description = QLabel(subtitle)
+        description.setObjectName("schedulerSectionDescription")
+        description.setWordWrap(True)
+        layout.addWidget(heading)
+        layout.addWidget(description)
+        layout.addSpacing(10)
+        return section
+
+    @staticmethod
+    def _setting_row(title: str, description: str, control: QWidget) -> QFrame:
+        row = QFrame()
+        row.setObjectName("schedulerSettingRow")
+        row.setMinimumWidth(0)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 11, 0, 11)
+        layout.setSpacing(20)
+        copy_container = QWidget()
+        copy_container.setObjectName("schedulerSettingCopy")
+        copy_container.setMinimumWidth(0)
+        copy_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        copy = QVBoxLayout(copy_container)
+        copy.setContentsMargins(0, 0, 0, 0)
+        copy.setSpacing(3)
+        heading = QLabel(title)
+        heading.setObjectName("schedulerSettingTitle")
+        heading.setWordWrap(True)
+        heading.setMinimumWidth(0)
+        heading.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        hint = QLabel(description)
+        hint.setObjectName("schedulerSettingDescription")
+        hint.setWordWrap(True)
+        hint.setMinimumWidth(0)
+        hint.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        copy.addWidget(heading)
+        copy.addWidget(hint)
+        layout.addWidget(copy_container, 1)
+        if control.property("compactControl"):
+            control.setMinimumWidth(112)
+            control.setMaximumWidth(128)
+        else:
+            control.setMinimumWidth(250)
+            control.setMaximumWidth(250)
+        layout.addWidget(control, alignment=Qt.AlignmentFlag.AlignTop)
+        return row
+
+    @staticmethod
+    def _fill_combo(combo: QComboBox, items, current_value: str) -> None:
+        SpacedRepetitionSettingsDialog._prepare_combo(combo)
+        for title, value in items:
+            combo.addItem(title, value)
+        index = combo.findData(current_value)
+        combo.setCurrentIndex(max(0, index))
+
+    @staticmethod
+    def _prepare_combo(combo: QComboBox) -> None:
+        combo.view().setObjectName("schedulerComboPopup")
+
+    @staticmethod
+    def _prepare_spinbox(spinbox: QAbstractSpinBox) -> None:
+        spinbox.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.PlusMinus)
+
+    @staticmethod
+    def _prepare_toggle(button: QPushButton) -> None:
+        button.setCheckable(True)
+        button.setProperty("schedulerToggle", True)
+        button.setProperty("compactControl", True)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.toggled.connect(
+            lambda checked: button.setText("Включено" if checked else "Выключено")
+        )
+        button.setText("Включено" if button.isChecked() else "Выключено")
+
+    @staticmethod
+    def _format_parameters(parameters) -> str:
+        return ", ".join(f"{value:g}" for value in parameters)
+
+    @staticmethod
+    def _format_steps(steps: tuple[int, ...]) -> str:
+        formatted = []
+        for seconds in steps:
+            if seconds % 86400 == 0:
+                value = seconds // 86400
+                forms = ("день", "дня", "дней")
+            elif seconds % 3600 == 0:
+                value = seconds // 3600
+                forms = ("час", "часа", "часов")
+            elif seconds % 60 == 0:
+                value = seconds // 60
+                forms = ("минута", "минуты", "минут")
+            else:
+                value = seconds
+                forms = ("секунда", "секунды", "секунд")
+            if value % 10 == 1 and value % 100 != 11:
+                unit = forms[0]
+            elif value % 10 in {2, 3, 4} and value % 100 not in {12, 13, 14}:
+                unit = forms[1]
+            else:
+                unit = forms[2]
+            formatted.append(f"{value} {unit}")
+        return "; ".join(formatted)
+
+    @staticmethod
+    def _parse_steps(source: str) -> tuple[int, ...]:
+        source = source.strip().lower()
+        if not source:
+            return ()
+        units = {
+            "с": 1, "s": 1, "сек": 1, "секунда": 1,
+            "секунды": 1, "секунд": 1,
+            "м": 60, "m": 60, "мин": 60, "минута": 60,
+            "минуты": 60, "минут": 60,
+            "ч": 3600, "h": 3600, "час": 3600,
+            "часа": 3600, "часов": 3600,
+            "д": 86400, "d": 86400, "дн": 86400, "день": 86400,
+            "дня": 86400, "дней": 86400,
+        }
+        steps = []
+        unit_pattern = "|".join(
+            re.escape(unit) for unit in sorted(units, key=len, reverse=True)
+        )
+        pattern = re.compile(rf"(\d+(?:[.,]\d+)?)\s*({unit_pattern})")
+        cursor = 0
+        for match in pattern.finditer(source):
+            if source[cursor:match.start()].strip(" ,;"):
+                raise ValueError(
+                    "Введите паузы словами, например: 2 минуты; 10 минут"
+                )
+            steps.append(
+                round(
+                    float(match.group(1).replace(",", "."))
+                    * units[match.group(2)]
+                )
+            )
+            cursor = match.end()
+        if not steps or source[cursor:].strip(" ,;"):
+            raise ValueError(
+                "Введите паузы словами, например: 2 минуты; 10 минут"
+            )
+        return tuple(steps)
+
+    def parsed_parameters(self) -> tuple[float, ...]:
+        source = self.parameters.toPlainText().replace(",", " ").replace(";", " ")
+        try:
+            return tuple(float(part) for part in source.split())
+        except ValueError as exception:
+            raise ValueError("Параметры FSRS должны быть числами через запятую") from exception
+
+    def apply_preset(self, index: int) -> None:
+        if index == 0:
+            self.retention.setValue(90)
+        elif index == 1:
+            self.retention.setValue(95)
+        elif index == 2:
+            self.retention.setValue(85)
+
+    def retention_changed(self, value: int) -> None:
+        if value not in {85, 90, 95}:
+            self.preset.blockSignals(True)
+            self.preset.setCurrentIndex(3)
+            self.preset.blockSignals(False)
+        self.retention_warning.setText(
+            "Выше 95% нагрузка растёт особенно быстро."
+            if value > 95
+            else "Диапазон 85–95% обычно даёт практичный баланс памяти и времени."
+        )
+        current = replace(self.config, desired_retention=value / 100)
+        baseline = replace(self.config, desired_retention=0.90)
+        current_interval = interval_for_stability(30.0, current)
+        baseline_interval = interval_for_stability(30.0, baseline)
+        difference = round((current_interval / baseline_interval - 1) * 100)
+        if difference == 0:
+            effect = "Ориентир: интервалы примерно как при стандартных 90%."
+        elif difference > 0:
+            effect = f"Ориентир: интервалы примерно на {difference}% длиннее, чем при 90%."
+        else:
+            effect = f"Ориентир: интервалы примерно на {abs(difference)}% короче, чем при 90%."
+        self.retention_effect.setText(effect)
+
+    def restore_defaults(self) -> None:
+        defaults = DEFAULT_CONFIG
+        self.preset.setCurrentIndex(0)
+        self.retention.setValue(round(defaults.desired_retention * 100))
+        self.daily_limit.setValue(30)
+        self.new_cards_limit.setValue(30)
+        self.new_card_order.setCurrentIndex(
+            max(0, self.new_card_order.findData(defaults.new_card_order))
+        )
+        self.new_review_order.setCurrentIndex(
+            max(0, self.new_review_order.findData(defaults.new_review_order))
+        )
+        self.review_order.setCurrentIndex(
+            max(0, self.review_order.findData(defaults.review_order))
+        )
+        self.minimum_interval.setValue(defaults.minimum_review_interval_days)
+        self.maximum_interval.setValue(round(defaults.maximum_interval_days))
+        self.fuzzing.setChecked(defaults.enable_fuzzing)
+        self.leech_threshold.setValue(defaults.leech_threshold)
+        self.leech_action.setCurrentIndex(
+            max(0, self.leech_action.findData(defaults.leech_action))
+        )
+        for control, value in zip(
+            self.easy_day_controls, defaults.easy_days_percentages
+        ):
+            control.setCurrentIndex(max(0, control.findData(value)))
+        self.learning_steps.setText(self._format_steps(defaults.learning_steps_seconds))
+        self.relearning_steps.setText(self._format_steps(defaults.relearning_steps_seconds))
+        self.parameters.setPlainText(self._format_parameters(defaults.fsrs_parameters))
+
+    def save(self) -> None:
+        try:
+            config = replace(
+                self.config,
+                desired_retention=self.retention.value() / 100,
+                learning_steps_seconds=self._parse_steps(self.learning_steps.text()),
+                relearning_steps_seconds=self._parse_steps(self.relearning_steps.text()),
+                minimum_review_interval_days=self.minimum_interval.value(),
+                maximum_interval_days=float(self.maximum_interval.value()),
+                enable_fuzzing=self.fuzzing.isChecked(),
+                easy_days_percentages=tuple(
+                    float(control.currentData()) for control in self.easy_day_controls
+                ),
+                new_card_order=str(self.new_card_order.currentData()),
+                new_review_order=str(self.new_review_order.currentData()),
+                review_order=str(self.review_order.currentData()),
+                leech_threshold=self.leech_threshold.value(),
+                leech_action=str(self.leech_action.currentData()),
+                fsrs_parameters=self.parsed_parameters(),
+            )
+            validate_config(config)
+        except ValueError as exception:
+            QMessageBox.warning(self, "Проверьте настройки", str(exception))
+            return
+        self.repository.set_scheduler_config(config)
+        self.repository.set_daily_limit(self.daily_limit.value())
+        self.repository.set_new_cards_limit(self.new_cards_limit.value())
+        if self.reschedule.isChecked():
+            self.repository.reschedule_review_cards(config)
+        self.config = config
+        self.accept()
+
+
 class CardListDialog(QDialog):
     def __init__(
         self,
@@ -432,26 +1135,27 @@ class CardListDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self.repository = repository
         self.setObjectName("cardListDialog")
         self.setWindowTitle("Все карточки")
         self.resize(820, 560)
         self.setMinimumSize(620, 420)
 
-        cards = repository.get_cards()
+        self.cards = repository.get_cards()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
         layout.setSpacing(16)
 
         heading = QLabel("Все карточки")
         heading.setObjectName("cardListTitle")
-        count = QLabel(f"Сохранено карточек: {len(cards)}")
+        count = QLabel(f"Сохранено карточек: {len(self.cards)}")
         count.setObjectName("cardListCount")
         layout.addWidget(heading)
         layout.addWidget(count)
 
-        self.table = QTableWidget(len(cards), 3)
+        self.table = QTableWidget(len(self.cards), 4)
         self.table.setObjectName("cardListTable")
-        self.table.setHorizontalHeaderLabels(("Слово", "Пиньинь", "Перевод"))
+        self.table.setHorizontalHeaderLabels(("Слово", "Пиньинь", "Перевод", "Состояние"))
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -461,9 +1165,15 @@ class CardListDialog(QDialog):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
 
-        for row, card in enumerate(cards):
-            values = (card.hanzi, card.pinyin, card.translation)
+        for row, card in enumerate(self.cards):
+            status = (
+                "Приостановлена"
+                if card.is_suspended
+                else ("Трудная" if card.is_leech else "Обычная")
+            )
+            values = (card.hanzi, card.pinyin, card.translation, status)
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
@@ -478,11 +1188,36 @@ class CardListDialog(QDialog):
                 self.table.setItem(row, column, item)
         layout.addWidget(self.table, 1)
 
+        self.resume_button = QPushButton("Вернуть в обучение")
+        self.resume_button.setObjectName("cardListResumeButton")
+        self.resume_button.setEnabled(False)
+        self.resume_button.clicked.connect(self.resume_selected_card)
+        self.table.itemSelectionChanged.connect(self.update_resume_button)
         close_button = QPushButton("Закрыть")
         close_button.setObjectName("cardListCloseButton")
         close_button.setCursor(Qt.CursorShape.PointingHandCursor)
         close_button.clicked.connect(self.accept)
-        layout.addWidget(close_button, alignment=Qt.AlignmentFlag.AlignRight)
+        actions = QHBoxLayout()
+        actions.addWidget(self.resume_button)
+        actions.addStretch()
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+
+    def update_resume_button(self) -> None:
+        row = self.table.currentRow()
+        self.resume_button.setEnabled(
+            0 <= row < len(self.cards) and self.cards[row].is_suspended
+        )
+
+    def resume_selected_card(self) -> None:
+        row = self.table.currentRow()
+        if not 0 <= row < len(self.cards) or not self.cards[row].is_suspended:
+            return
+        card = self.cards[row]
+        self.repository.set_card_suspended(card.id, False)
+        self.cards[row] = replace(card, is_suspended=False)
+        self.table.item(row, 3).setText("Трудная" if card.is_leech else "Обычная")
+        self.update_resume_button()
 
 
 class StudyPage(QWidget):
@@ -539,49 +1274,35 @@ class StudyPage(QWidget):
         header.addLayout(headings)
         header.addStretch()
 
-        self.import_anki_button = QPushButton("Импорт карточек")
+        self.import_anki_button = QPushButton("Импорт из Anki")
         self.import_anki_button.setObjectName("importCardsButton")
         self.import_anki_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.import_anki_button.setToolTip("Импортировать текстовый экспорт Anki")
+        self.import_anki_button.setToolTip("Импортировать карточки из Anki")
         self.import_anki_button.clicked.connect(self.import_anki_cards)
+        self.export_anki_button = QPushButton("Экспорт в Anki")
+        self.export_anki_button.setObjectName("exportAnkiButton")
+        self.export_anki_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.export_anki_button.setToolTip(
+            "Сохранить все карточки в формате для импорта в Anki"
+        )
+        self.export_anki_button.clicked.connect(self.export_anki_cards)
         self.card_list_button = QPushButton("Все карточки")
         self.card_list_button.setObjectName("cardListButton")
         self.card_list_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.card_list_button.setToolTip("Показать список всех сохранённых карточек")
         self.card_list_button.clicked.connect(self.show_card_list)
+        self.scheduler_settings_button = QPushButton("Настройки повторения")
+        self.scheduler_settings_button.setObjectName("schedulerSettingsButton")
+        self.scheduler_settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.scheduler_settings_button.setToolTip(
+            "Настроить FSRS, желаемое усвоение и интервалы"
+        )
+        self.scheduler_settings_button.clicked.connect(self.show_scheduler_settings)
         self.manual_card_button = QPushButton("Новая карточка")
         self.manual_card_button.setObjectName("manualCardButton")
         self.manual_card_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.manual_card_button.clicked.connect(self.add_manual_card)
 
-        limit_label = QLabel("Карточек в день")
-        limit_label.setObjectName("studySettingLabel")
-        self.daily_limit = QSpinBox()
-        self.daily_limit.setObjectName("dailyLimit")
-        self.daily_limit.setRange(1, 1000)
-        self.daily_limit.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.daily_limit.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.daily_limit.setValue(repository.get_daily_limit())
-        self.daily_limit.valueChanged.connect(self.change_daily_limit)
-        limit_control = QFrame()
-        limit_control.setObjectName("limitControl")
-        self.limit_control = limit_control
-        limit_layout = QHBoxLayout(limit_control)
-        limit_layout.setContentsMargins(3, 3, 3, 3)
-        limit_layout.setSpacing(2)
-        decrease = QPushButton("−")
-        decrease.setObjectName("limitStepButton")
-        decrease.setCursor(Qt.CursorShape.PointingHandCursor)
-        decrease.clicked.connect(self.daily_limit.stepDown)
-        increase = QPushButton("+")
-        increase.setObjectName("limitStepButton")
-        increase.setCursor(Qt.CursorShape.PointingHandCursor)
-        increase.clicked.connect(self.daily_limit.stepUp)
-        limit_layout.addWidget(decrease)
-        limit_layout.addWidget(self.daily_limit)
-        limit_layout.addWidget(increase)
-        header.addWidget(limit_label)
-        header.addWidget(limit_control)
         root.addLayout(header)
 
         actions = QHBoxLayout()
@@ -589,6 +1310,8 @@ class StudyPage(QWidget):
         actions.addWidget(self.manual_card_button)
         actions.addWidget(self.card_list_button)
         actions.addWidget(self.import_anki_button)
+        actions.addWidget(self.export_anki_button)
+        actions.addWidget(self.scheduler_settings_button)
         actions.addStretch()
         root.addLayout(actions)
 
@@ -628,10 +1351,6 @@ class StudyPage(QWidget):
                 lambda selected_rating=rating: self.rate_from_keyboard(selected_rating)
             )
             self.rating_shortcuts[rating] = shortcut
-        application = QApplication.instance()
-        if application is not None:
-            application.focusChanged.connect(self.update_shortcut_scope)
-
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setInterval(30_000)
         self.refresh_timer.timeout.connect(self.refresh_if_waiting)
@@ -840,16 +1559,12 @@ class StudyPage(QWidget):
             size = 15
         return QFont(self.russian_font_family, size, QFont.Weight.Normal)
 
-    def change_daily_limit(self, value: int) -> None:
-        self.repository.set_daily_limit(value)
-        self.refresh()
-
     def import_anki_cards(self) -> None:
         path, _selected_filter = QFileDialog.getOpenFileName(
             self,
-            "Импорт карточек Anki",
+            "Импорт из Anki",
             str(Path.home()),
-            "Текстовый экспорт Anki (*.txt *.tsv *.csv);;Все файлы (*)",
+            "Текстовый экспорт карточек (*.txt *.tsv *.csv);;Все файлы (*)",
         )
         if not path:
             return
@@ -859,7 +1574,7 @@ class StudyPage(QWidget):
             QMessageBox.warning(
                 self,
                 "Не удалось импортировать карточки",
-                f"Файл не похож на текстовый экспорт Anki.\n{exception}",
+                f"Файл не похож на поддерживаемый текстовый экспорт карточек.\n{exception}",
             )
             return
 
@@ -878,13 +1593,54 @@ class StudyPage(QWidget):
         )
         self.example_pool.start(task)
 
+    def export_anki_cards(self) -> None:
+        cards = self.repository.get_cards()
+        if not cards:
+            QMessageBox.information(
+                self,
+                "Экспорт в Anki",
+                "В HanziLab пока нет карточек для экспорта.",
+            )
+            return
+
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Экспорт карточек в Anki",
+            str(Path.home() / "HanziLab.apkg"),
+            "Пакет колоды Anki (*.apkg);;Все файлы (*)",
+        )
+        if not path:
+            return
+        if not Path(path).suffix:
+            path += ".apkg"
+        try:
+            exported = export_anki_package(cards, path)
+        except (OSError, UnicodeError, ValueError) as exception:
+            QMessageBox.warning(
+                self,
+                "Не удалось экспортировать карточки",
+                f"Не удалось сохранить файл.\n{exception}",
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Экспорт завершён",
+            (
+                f"Экспортировано слов: {exported}\n\n"
+                "Порядок импорта в Anki:\n"
+                "1. Выберите «Файл → Импорт».\n"
+                "2. Откройте сохранённый файл."
+            ),
+        )
+
     def finish_anki_import(
         self, generation: int, rows: object, error: object
     ) -> None:
         if self.shutting_down or generation != self.anki_import_generation:
             return
         self.import_anki_button.setEnabled(True)
-        self.import_anki_button.setText("Импорт карточек")
+        self.import_anki_button.setText("Импорт из Anki")
         result = self.pending_anki_import
         self.pending_anki_import = None
         if error is not None or result is None:
@@ -953,6 +1709,12 @@ class StudyPage(QWidget):
             self,
         )
         dialog.exec()
+
+    def show_scheduler_settings(self) -> None:
+        dialog = SpacedRepetitionSettingsDialog(self.repository, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.session.invalidate_daily_priority(utc_now())
+            self.refresh()
 
     def manual_card_was_added(self, _hanzi: str) -> None:
         self.refresh()
@@ -1131,7 +1893,9 @@ class StudyPage(QWidget):
             self.answer_pinyin.setFont(QFont(self.russian_font_family, 15))
         self.card_sides.setCurrentIndex(1)
         self.rating_area.setVisible(True)
-        previews = preview_ratings(card, utc_now())
+        previews = preview_ratings(
+            card, utc_now(), self.repository.get_scheduler_config()
+        )
         for rating, button in self.rating_buttons.items():
             button.setText(f"{RATING_LABELS[rating]}\n{format_interval(previews[rating])}")
 
@@ -1142,23 +1906,6 @@ class StudyPage(QWidget):
             and self.card_sides.currentIndex() == 0
         ):
             self.show_answer()
-
-    def update_shortcut_scope(self, _old_widget: QWidget | None, new_widget: QWidget | None) -> None:
-        """Lets the daily-limit editor receive digits, Enter and Space normally."""
-        editing_limit = bool(
-            new_widget
-            and (
-                new_widget is self.limit_control
-                or self.limit_control.isAncestorOf(new_widget)
-            )
-        )
-        enabled = not editing_limit
-        for shortcut in self.answer_shortcuts:
-            shortcut.setEnabled(enabled)
-        for shortcut in self.pinyin_shortcuts:
-            shortcut.setEnabled(enabled)
-        for shortcut in self.rating_shortcuts.values():
-            shortcut.setEnabled(enabled)
 
     def open_pinyin_from_keyboard(self) -> None:
         if (

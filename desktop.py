@@ -24,6 +24,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QComboBox,
     QDialog,
@@ -51,7 +52,9 @@ import dictionary_remote
 from copybook_pdf import (
     CopybookError,
     CopybookStyle,
+    generate_assembled_copybook,
     generate_hanzi_copybook,
+    hanzi_sequence,
     suggested_copybook_name,
 )
 from cursive_view import CursivePage
@@ -61,7 +64,7 @@ from scripts.text_normalization import CJK_RE
 from scripts.text_normalization import normalize_pinyin as _pinyin_base
 from stroke_order import StrokeOrderPanel
 from study_database import StudyRepository
-from study_view import StudyPage
+from study_view import NoWheelComboBox, NoWheelSpinBox, StudyPage
 from text_formatting import (
     format_example_blocks,
     normalize_display_text,
@@ -73,6 +76,8 @@ FONT_DIR = RESOURCE_ROOT / "assets" / "fonts"
 ICON_DIR = RESOURCE_ROOT / "assets" / "icons"
 APP_ICON_PNG = ICON_DIR / "hanzilab.png"
 APP_ICON_ICO = ICON_DIR / "hanzilab.ico"
+SPINBOX_PLUS_ICON = ICON_DIR / "spinbox-plus.svg"
+SPINBOX_MINUS_ICON = ICON_DIR / "spinbox-minus.svg"
 KAITI_FAMILY = "KaiTi"
 XINGSHU_FAMILY = "QXyingbixing"
 INPUT_KAITI_FAMILY = "HanziLab KaiTi CJK"
@@ -349,6 +354,341 @@ class ResultRow(QWidget):
 
         layout.addWidget(hanzi)
         layout.addLayout(text, 1)
+
+
+class CopybookCollectionDialog(QDialog):
+    def __init__(self, hanzi_font_family: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.hanzi_font_family = hanzi_font_family
+        self.setObjectName("copybookCollectionDialog")
+        self.setWindowTitle("Собрать прописи")
+        self.setWindowIcon(QIcon(str(APP_ICON_PNG)))
+        self.setFont(QFont(RUSSIAN_FONT_FAMILY, 10))
+        self.resize(850, 610)
+        self.setMinimumSize(700, 520)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 26, 28, 24)
+        layout.setSpacing(14)
+
+        title = QLabel("Собрать прописи")
+        title.setObjectName("copybookCollectionTitle")
+        subtitle = QLabel(
+            "Найдите иероглифы или слова, добавьте их в список и создайте один PDF."
+        )
+        subtitle.setObjectName("copybookCollectionSubtitle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        search_shell = QFrame()
+        search_shell.setObjectName("collectionSearchShell")
+        search_layout = QHBoxLayout(search_shell)
+        search_layout.setContentsMargins(14, 4, 7, 4)
+        self.search = QLineEdit()
+        self.search.setObjectName("collectionSearch")
+        self.search.setPlaceholderText("Введите 学习, xuéxí или «учиться»")
+        self.search.setClearButtonEnabled(True)
+        search_font = QFont()
+        search_font.setFamilies([INPUT_KAITI_FAMILY, RUSSIAN_FONT_FAMILY])
+        search_font.setPointSize(13)
+        self.search.setFont(search_font)
+        self.search.setMinimumHeight(52)
+        self.search.returnPressed.connect(self.run_search)
+        self.search.textChanged.connect(self.schedule_search)
+        search_layout.addWidget(self.search, 1)
+        layout.addWidget(search_shell)
+
+        self.search_generation = 0
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(280)
+        self.search_timer.timeout.connect(self.run_search)
+        self.finished.connect(self.stop_search)
+
+        columns = QSplitter(Qt.Orientation.Horizontal)
+        columns.setObjectName("collectionSplitter")
+        columns.setChildrenCollapsible(False)
+
+        results_panel = QFrame()
+        results_panel.setObjectName("collectionPanel")
+        results_layout = QVBoxLayout(results_panel)
+        results_layout.setContentsMargins(14, 14, 14, 14)
+        results_label = QLabel("РЕЗУЛЬТАТЫ ПОИСКА")
+        results_label.setObjectName("collectionSectionLabel")
+        self.search_status = QLabel("Введите запрос")
+        self.search_status.setObjectName("collectionHint")
+        self.results = QListWidget()
+        self.results.setObjectName("collectionList")
+        self.results.itemDoubleClicked.connect(self.add_selected_result)
+        add_button = QPushButton("Добавить в сборник →")
+        add_button.setObjectName("collectionSecondaryButton")
+        add_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_button.clicked.connect(self.add_selected_result)
+        results_layout.addWidget(results_label)
+        results_layout.addWidget(self.search_status)
+        results_layout.addWidget(self.results, 1)
+        results_layout.addWidget(add_button)
+        columns.addWidget(results_panel)
+
+        selected_panel = QFrame()
+        selected_panel.setObjectName("collectionPanel")
+        selected_layout = QVBoxLayout(selected_panel)
+        selected_layout.setContentsMargins(14, 14, 14, 14)
+        selected_label = QLabel("ОБЩИЙ СПИСОК")
+        selected_label.setObjectName("collectionSectionLabel")
+        self.selected_status = QLabel("Пока ничего не добавлено")
+        self.selected_status.setObjectName("collectionHint")
+        self.selected = QListWidget()
+        self.selected.setObjectName("collectionList")
+        self.selected.itemDoubleClicked.connect(self.remove_selected_item)
+        remove_button = QPushButton("Удалить из списка")
+        remove_button.setObjectName("collectionSecondaryButton")
+        remove_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_button.clicked.connect(self.remove_selected_item)
+        selected_layout.addWidget(selected_label)
+        selected_layout.addWidget(self.selected_status)
+        selected_layout.addWidget(self.selected, 1)
+        selected_layout.addWidget(remove_button)
+        columns.addWidget(selected_panel)
+        columns.setSizes([410, 410])
+        layout.addWidget(columns, 1)
+
+        settings = QFrame()
+        settings.setObjectName("collectionSettings")
+        settings_layout = QHBoxLayout(settings)
+        settings_layout.setContentsMargins(16, 12, 16, 12)
+        spacing_label = QLabel("Пустых строк между элементами")
+        spacing_label.setObjectName("collectionSettingLabel")
+        self.row_spacing = NoWheelSpinBox()
+        self.row_spacing.setObjectName("collectionSpacing")
+        self.row_spacing.setRange(0, 20)
+        self.row_spacing.setValue(3)
+        self.row_spacing.setSuffix(" стр.")
+        self.row_spacing.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.PlusMinus)
+        style_label = QLabel("Стиль")
+        style_label.setObjectName("collectionSettingLabel")
+        self.style = NoWheelComboBox()
+        self.style.setObjectName("collectionStyle")
+        self.style.view().setObjectName("collectionStylePopup")
+        self.style.addItem(
+            "楷书 · стандартные прописи",
+            CopybookStyle.KAITI.value,
+        )
+        self.style.addItem(
+            "行书 · прописи XingShu",
+            CopybookStyle.XINGSHU.value,
+        )
+        settings_layout.addWidget(spacing_label)
+        settings_layout.addWidget(self.row_spacing)
+        settings_layout.addSpacing(18)
+        settings_layout.addWidget(style_label)
+        settings_layout.addWidget(self.style)
+        settings_layout.addStretch()
+        layout.addWidget(settings)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel_button = QPushButton("Отмена")
+        cancel_button.setObjectName("collectionCancelButton")
+        cancel_button.clicked.connect(self.reject)
+        self.generate_button = QPushButton("Создать PDF")
+        self.generate_button.setObjectName("collectionPrimaryButton")
+        self.generate_button.setEnabled(False)
+        self.generate_button.clicked.connect(self.create_pdf)
+        actions.addWidget(cancel_button)
+        actions.addWidget(self.generate_button)
+        layout.addLayout(actions)
+        self.search.setFocus()
+
+    def schedule_search(self, text: str) -> None:
+        self.search_timer.stop()
+        self.search_generation += 1
+        self.results.clear()
+        if not normalize_display_text(text, preserve_line_breaks=False):
+            self.search_status.setText("Введите запрос")
+            return
+        self.search_status.setText("Поиск…")
+        self.search_timer.start()
+
+    def run_search(self) -> None:
+        self.search_timer.stop()
+        query = normalize_display_text(self.search.text(), preserve_line_breaks=False)
+        self.results.clear()
+        if not query:
+            self.search_status.setText("Введите запрос")
+            return
+        self.search_generation += 1
+        generation = self.search_generation
+        self.search_status.setText("Поиск…")
+        parent = self.parent()
+        if hasattr(parent, "start_background_task"):
+            task = BackgroundTask(
+                generation,
+                search_entries,
+                query,
+                40,
+                category="collection-search",
+            )
+            task.signals.finished.connect(
+                lambda task_generation, rows, error, requested=query:
+                    self.apply_collection_search_results(
+                        task_generation,
+                        requested,
+                        rows,
+                        error,
+                    )
+            )
+            parent.start_background_task(task)
+            return
+        try:
+            rows = search_entries(query, 40)
+            error = None
+        except Exception as exception:  # noqa: BLE001 - граница источника.
+            rows = None
+            error = exception
+        self.apply_collection_search_results(generation, query, rows, error)
+
+    def apply_collection_search_results(
+        self,
+        generation: int,
+        query: str,
+        rows: object,
+        error: object,
+    ) -> None:
+        if (
+            generation != self.search_generation
+            or query
+            != normalize_display_text(
+                self.search.text(), preserve_line_breaks=False
+            )
+        ):
+            return
+        self.results.clear()
+        if error is not None:
+            self.search_status.setText("Словарь недоступен")
+            return
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            hanzi = normalize_display_text(row.get("hanzi", ""), preserve_line_breaks=False)
+            if not hanzi_sequence(hanzi):
+                continue
+            result = {
+                "hanzi": hanzi,
+                "pinyin": normalize_display_text(
+                    row.get("pinyin", ""), preserve_line_breaks=False
+                ),
+                "translation": normalize_display_text(
+                    row.get("translation", ""), preserve_line_breaks=False
+                ),
+            }
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, result)
+            item.setSizeHint(QSize(100, 82))
+            self.results.addItem(item)
+            self.results.setItemWidget(
+                item,
+                ResultRow(result, self.hanzi_font_family),
+            )
+        self.search_status.setText(
+            f"Найдено: {self.results.count()}"
+            if self.results.count()
+            else "Ничего не найдено"
+        )
+        if self.results.count():
+            self.results.setCurrentRow(0)
+
+    def stop_search(self, _result: int = 0) -> None:
+        self.search_timer.stop()
+        self.search_generation += 1
+        parent = self.parent()
+        if hasattr(parent, "cancel_background_tasks"):
+            parent.cancel_background_tasks("collection-search")
+
+    def add_selected_result(self, _item: QListWidgetItem | None = None) -> None:
+        item = self.results.currentItem()
+        if item is None:
+            return
+        result = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(result, dict):
+            return
+        hanzi = result.get("hanzi", "")
+        existing = {
+            self.selected.item(index).data(Qt.ItemDataRole.UserRole).get("hanzi", "")
+            for index in range(self.selected.count())
+        }
+        if not hanzi or hanzi in existing:
+            return
+        selected_item = QListWidgetItem()
+        selected_item.setData(Qt.ItemDataRole.UserRole, result)
+        selected_item.setSizeHint(QSize(100, 82))
+        self.selected.addItem(selected_item)
+        self.selected.setItemWidget(
+            selected_item,
+            ResultRow(result, self.hanzi_font_family),
+        )
+        self.selected.setCurrentItem(selected_item)
+        self.update_selected_status()
+
+    def remove_selected_item(self, _item: QListWidgetItem | None = None) -> None:
+        row = self.selected.currentRow()
+        if row >= 0:
+            self.selected.takeItem(row)
+            self.update_selected_status()
+
+    def update_selected_status(self) -> None:
+        count = self.selected.count()
+        self.selected_status.setText(
+            f"Добавлено: {count}"
+            if count
+            else "Пока ничего не добавлено"
+        )
+        self.generate_button.setEnabled(count > 0)
+
+    def selected_hanzi(self) -> list[str]:
+        return [
+            self.selected.item(index).data(Qt.ItemDataRole.UserRole)["hanzi"]
+            for index in range(self.selected.count())
+        ]
+
+    def create_pdf(self) -> None:
+        items = self.selected_hanzi()
+        if not items:
+            return
+        style = CopybookStyle(self.style.currentData())
+        suffix = "_行书" if style is CopybookStyle.XINGSHU else ""
+        suggested = Path.home() / "Documents" / f"сборник_прописей{suffix}.pdf"
+        if not suggested.parent.exists():
+            suggested = Path.home() / suggested.name
+        output_path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Собрать прописи",
+            str(suggested),
+            "PDF (*.pdf)",
+        )
+        if not output_path:
+            return
+        try:
+            result = generate_assembled_copybook(
+                items,
+                output_path,
+                row_spacing=self.row_spacing.value(),
+                style=style,
+            )
+        except (CopybookError, OSError) as exception:
+            QMessageBox.warning(self, "Не удалось создать прописи", str(exception))
+            return
+        message = f"Сборник сохранён:\n{result.path}"
+        if result.missing_characters:
+            missing_label = (
+                "Нет образца XingShu для: "
+                if style is CopybookStyle.XINGSHU
+                else "Нет данных о порядке черт для: "
+            )
+            message += "\n\n" + missing_label + "、".join(result.missing_characters)
+        QMessageBox.information(self, "Прописи созданы", message)
+        self.accept()
 
 
 class HanziLabWindow(QMainWindow):
@@ -824,6 +1164,14 @@ class HanziLabWindow(QMainWindow):
         heading_box.addWidget(subtitle)
         header.addLayout(heading_box)
         header.addStretch()
+        self.collection_button = QPushButton("Собрать прописи")
+        self.collection_button.setObjectName("collectionOpenButton")
+        self.collection_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.collection_button.setToolTip(
+            "Найти несколько слов или иероглифов и собрать их в один PDF"
+        )
+        self.collection_button.clicked.connect(self.open_copybook_collection)
+        header.addWidget(self.collection_button)
         layout.addLayout(header)
         layout.addSpacing(24)
 
@@ -850,11 +1198,6 @@ class HanziLabWindow(QMainWindow):
         handwriting_button.setToolTip("Нарисовать иероглиф")
         handwriting_button.clicked.connect(self.open_handwriting_input)
         search_layout.addWidget(handwriting_button)
-        search_button = QPushButton("Найти")
-        search_button.setObjectName("searchButton")
-        search_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        search_button.clicked.connect(self.run_search)
-        search_layout.addWidget(search_button)
         layout.addWidget(search_shell)
         layout.addSpacing(18)
 
@@ -888,6 +1231,10 @@ class HanziLabWindow(QMainWindow):
         splitter.setSizes([460, 560])
         layout.addWidget(splitter, 1)
         return content
+
+    def open_copybook_collection(self) -> None:
+        dialog = CopybookCollectionDialog(self.hanzi_font_family, self)
+        dialog.exec()
 
     def open_handwriting_input(self) -> None:
         dialog = HandwritingDialog(self.hanzi_font_family, self)
@@ -945,7 +1292,7 @@ class HanziLabWindow(QMainWindow):
         self.copybook_button.setObjectName("createCopybookButton")
         self.copybook_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.copybook_button.setToolTip(
-            "Выбрать стиль и создать PDF с порядком черт"
+            "Выбрать стиль и создать PDF-прописи"
         )
         self.copybook_menu = QMenu(self.copybook_button)
         self.copybook_menu.setObjectName("copybookMenu")
@@ -961,7 +1308,7 @@ class HanziLabWindow(QMainWindow):
         )
         self.copybook_xingshu_action.setObjectName("copybookXingshuAction")
         self.copybook_xingshu_action.setToolTip(
-            "Образцы XingShu с последовательностью написания черт"
+            "Цельные образцы XingShu без пошагового порядка черт"
         )
         self.copybook_kaiti_action.triggered.connect(
             lambda _checked=False: self.create_copybook_pdf(CopybookStyle.KAITI)
@@ -1060,10 +1407,12 @@ class HanziLabWindow(QMainWindow):
             f"Прописи {result.style.display_name} сохранены:\n{result.path}"
         )
         if result.missing_characters:
-            message += (
-                "\n\nНет данных о порядке черт для: "
-                + "、".join(result.missing_characters)
+            missing_label = (
+                "Нет образца XingShu для: "
+                if result.style is CopybookStyle.XINGSHU
+                else "Нет данных о порядке черт для: "
             )
+            message += "\n\n" + missing_label + "、".join(result.missing_characters)
         QMessageBox.information(self, "Прописи созданы", message)
 
     def show_edit_menu(self, position) -> None:
@@ -1453,9 +1802,6 @@ QFrame#searchShell { background: #FFFFFF; border: 1px solid #DCE2E5; border-radi
 QFrame#searchShell:focus-within { border-color: #E05945; }
 QLineEdit#searchInput { border: none; background: transparent; color: #182026; padding: 0 4px; }
 QLineEdit#searchInput::placeholder { color: #96A2A7; }
-QPushButton#searchButton { background: #E05945; color: white; border: none; border-radius: 9px; padding: 12px 22px; font-size: 13px; font-weight: 700; }
-QPushButton#searchButton:hover { background: #C94D3C; }
-QPushButton#searchButton:pressed { background: #B44334; }
 QPushButton#handwritingButton { background: #F2F6F7; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; min-width: 44px; max-width: 44px; min-height: 40px; max-height: 40px; padding: 0; }
 QPushButton#handwritingButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
 QPushButton#handwritingButton:pressed { background: #FADFD9; color: #B44334; }
@@ -1493,6 +1839,38 @@ QLabel#detailPinyin { color: #D45240; font-size: 18px; font-weight: 600; }
 QPushButton#createCopybookButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 9px 13px; font-size: 12px; font-weight: 600; }
 QPushButton#createCopybookButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
 QPushButton#createCopybookButton:pressed { background: #FADFD9; color: #B44334; }
+QPushButton#collectionOpenButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 10px 15px; font-size: 12px; font-weight: 600; }
+QPushButton#collectionOpenButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QDialog#copybookCollectionDialog { background: #F4F6F8; color: #182026; }
+QLabel#copybookCollectionTitle { color: #182026; font-size: 28px; font-weight: 700; }
+QLabel#copybookCollectionSubtitle { color: #6E7C83; font-size: 13px; }
+QFrame#collectionSearchShell { background: #FFFFFF; border: 1px solid #DCE2E5; border-radius: 13px; }
+QLineEdit#collectionSearch { background: transparent; color: #182026; border: none; padding: 0 4px; }
+QFrame#collectionPanel { background: #FFFFFF; border: 1px solid #DFE4E6; border-radius: 12px; }
+QLabel#collectionSectionLabel { color: #8B989D; font-size: 10px; font-weight: 700; letter-spacing: 1.2px; }
+QLabel#collectionHint { color: #75838A; font-size: 11px; }
+QListWidget#collectionList { background: #FFFFFF; color: #253239; border: 1px solid #E2E7E9; border-radius: 8px; outline: none; }
+QListWidget#collectionList::item { border-bottom: 1px solid #EDF0F1; }
+QListWidget#collectionList::item:selected { background: #FFF1ED; color: #B44334; border-left: 3px solid #E05945; }
+QFrame#collectionSettings { background: #FFFFFF; border: 1px solid #DFE4E6; border-radius: 10px; }
+QLabel#collectionSettingLabel { color: #536269; font-size: 12px; }
+QSpinBox#collectionSpacing, QComboBox#collectionStyle { background: #F4F7F8; color: #344249; border: 1px solid #D7DEE1; border-radius: 8px; padding: 8px 30px 8px 11px; min-height: 20px; font-size: 12px; }
+QSpinBox#collectionSpacing:hover, QComboBox#collectionStyle:hover { background: #FFF9F7; border-color: #E8B5AC; }
+QSpinBox#collectionSpacing:focus, QComboBox#collectionStyle:focus { background: #FFFFFF; border-color: #E05945; }
+QComboBox#collectionStyle::drop-down { border: none; width: 24px; }
+QAbstractItemView#collectionStylePopup { background: #FFFFFF; color: #344249; border: 1px solid #D7DEE1; border-radius: 8px; padding: 4px; outline: none; selection-background-color: #FFF1ED; selection-color: #C94D3C; }
+QAbstractItemView#collectionStylePopup::item { min-height: 30px; padding: 4px 9px; border-radius: 6px; }
+QAbstractItemView#collectionStylePopup::item:hover { background: #F8FAFA; color: #26343B; }
+QAbstractItemView#collectionStylePopup::item:selected { background: #FFF1ED; color: #C94D3C; }
+QSpinBox#collectionSpacing::up-button, QSpinBox#collectionSpacing::down-button { background: #EEF2F3; border: none; border-left: 1px solid #D7DEE1; width: 24px; }
+QSpinBox#collectionSpacing::up-button { border-top-right-radius: 7px; }
+QSpinBox#collectionSpacing::down-button { border-bottom-right-radius: 7px; }
+QSpinBox#collectionSpacing::up-button:hover, QSpinBox#collectionSpacing::down-button:hover { background: #FFF1ED; }
+QPushButton#collectionPrimaryButton { background: #E05945; color: #FFFFFF; border: none; border-radius: 9px; padding: 12px 22px; font-size: 13px; font-weight: 700; }
+QPushButton#collectionPrimaryButton:hover { background: #C94D3C; }
+QPushButton#collectionPrimaryButton:disabled { background: #D9E0E3; color: #89969C; }
+QPushButton#collectionSecondaryButton, QPushButton#collectionCancelButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 8px; padding: 9px 13px; font-size: 12px; }
+QPushButton#collectionSecondaryButton:hover, QPushButton#collectionCancelButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
 QMenu#copybookMenu { background: #FFFFFF; color: #334249; border: 1px solid #D7DEE1; border-radius: 9px; padding: 5px; }
 QMenu#copybookMenu::item { border-radius: 7px; padding: 9px 16px; }
 QMenu#copybookMenu::item:selected { background: #FFF1ED; color: #C94D3C; }
@@ -1510,22 +1888,60 @@ QFrame#strokeCharacterSelector { background: #F3F6F7; border: 1px solid #DEE5E7;
 QPushButton#strokeCharacterChip { background: transparent; color: #405057; border: none; border-radius: 8px; min-width: 42px; min-height: 38px; padding: 0 8px; }
 QPushButton#strokeCharacterChip:hover { background: #FFFFFF; color: #D45240; }
 QPushButton#strokeCharacterChip:checked { background: #FFFFFF; color: #D45240; border: 1px solid #E8D8D4; font-weight: 700; }
-QPushButton#strokeButton, QPushButton#strokePlayButton { border: 1px solid #D7DEE1; border-radius: 8px; padding: 8px 12px; font-size: 12px; }
-QPushButton#strokeButton { background: #FFFFFF; color: #425159; }
-QPushButton#strokePlayButton { background: #E05945; color: #FFFFFF; border-color: #E05945; font-weight: 700; }
-QPushButton#strokeButton:hover { background: #F4F7F8; }
-QPushButton#strokePlayButton:hover { background: #C94D3C; }
-QPushButton#strokeButton:disabled { color: #B7C0C4; background: #F8F9FA; }
 QLabel#strokeStatus { color: #75838A; font-size: 12px; }
 QWidget#studyPage { background: #F4F6F8; }
 QLabel#studySettingLabel, QLabel#studyQueueInfo { color: #6E7C83; font-size: 12px; }
-QPushButton#importCardsButton, QPushButton#cardListButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 10px 14px; font-size: 12px; font-weight: 600; }
-QPushButton#importCardsButton:hover, QPushButton#cardListButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
-QPushButton#importCardsButton:pressed, QPushButton#cardListButton:pressed { background: #FADFD9; color: #B44334; }
+QPushButton#importCardsButton, QPushButton#exportAnkiButton, QPushButton#cardListButton, QPushButton#schedulerSettingsButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 10px 14px; font-size: 12px; font-weight: 600; }
+QPushButton#importCardsButton:hover, QPushButton#exportAnkiButton:hover, QPushButton#cardListButton:hover, QPushButton#schedulerSettingsButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QPushButton#importCardsButton:pressed, QPushButton#exportAnkiButton:pressed, QPushButton#cardListButton:pressed, QPushButton#schedulerSettingsButton:pressed { background: #FADFD9; color: #B44334; }
 QPushButton#manualCardButton { background: #E05945; color: #FFFFFF; border: none; border-radius: 9px; padding: 11px 15px; font-size: 12px; font-weight: 700; }
 QPushButton#manualCardButton:hover { background: #C94D3C; }
 QPushButton#manualCardButton:pressed { background: #B44334; }
 QDialog#cardListDialog { background: #F7F9FA; }
+QDialog#spacedRepetitionSettingsDialog { background: #F7F9FA; }
+QLabel#settingsDialogTitle { color: #182026; font-size: 20px; font-weight: 700; }
+QLabel#settingsDialogHint { color: #66767D; font-size: 12px; }
+QScrollArea#schedulerSettingsScroll { background: transparent; border: none; }
+QScrollArea#schedulerSettingsScroll > QWidget > QWidget { background: #F7F9FA; }
+QWidget#schedulerSettingsContent { background: #F7F9FA; }
+QFrame#schedulerSettingsSection, QFrame#fsrsSettingsSection { background: #FFFFFF; border: 1px solid #DCE3E5; border-radius: 11px; }
+QFrame#fsrsSettingsSection { border-color: #E8C3BC; }
+QLabel#schedulerSectionTitle { color: #182026; font-size: 15px; font-weight: 700; }
+QLabel#schedulerSectionDescription { color: #75838A; font-size: 12px; padding-top: 2px; }
+QFrame#schedulerSettingRow { background: transparent; border: none; border-top: 1px solid #EDF0F1; }
+QLabel#schedulerSettingTitle { color: #26343B; font-size: 13px; font-weight: 600; }
+QLabel#schedulerSettingDescription { color: #75838A; font-size: 11px; }
+QLabel#easyDayLabel { color: #66767D; font-size: 11px; font-weight: 600; }
+QComboBox#easyDayLoad { min-width: 70px; }
+QDialog#spacedRepetitionSettingsDialog QLineEdit, QDialog#spacedRepetitionSettingsDialog QSpinBox, QDialog#spacedRepetitionSettingsDialog QDoubleSpinBox, QDialog#spacedRepetitionSettingsDialog QComboBox, QPlainTextEdit#fsrsParameters { background: #F4F7F8; color: #344249; border: 1px solid #D7DEE1; border-radius: 8px; padding: 8px 30px 8px 11px; min-height: 20px; font-size: 12px; selection-background-color: #FADFD9; selection-color: #9F3528; }
+QDialog#spacedRepetitionSettingsDialog QLineEdit:hover, QDialog#spacedRepetitionSettingsDialog QSpinBox:hover, QDialog#spacedRepetitionSettingsDialog QDoubleSpinBox:hover, QDialog#spacedRepetitionSettingsDialog QComboBox:hover, QPlainTextEdit#fsrsParameters:hover { background: #FFF9F7; border-color: #E8B5AC; }
+QDialog#spacedRepetitionSettingsDialog QLineEdit:focus, QDialog#spacedRepetitionSettingsDialog QSpinBox:focus, QDialog#spacedRepetitionSettingsDialog QDoubleSpinBox:focus, QDialog#spacedRepetitionSettingsDialog QComboBox:focus, QPlainTextEdit#fsrsParameters:focus { background: #FFFFFF; border-color: #E05945; }
+QDialog#spacedRepetitionSettingsDialog QComboBox::drop-down { background: transparent; border: none; width: 28px; }
+QAbstractItemView#schedulerComboPopup { background: #FFFFFF; color: #344249; border: 1px solid #D7DEE1; border-radius: 8px; padding: 4px; outline: none; selection-background-color: #FFF1ED; selection-color: #C94D3C; }
+QAbstractItemView#schedulerComboPopup::item { min-height: 30px; padding: 4px 9px; border-radius: 6px; }
+QAbstractItemView#schedulerComboPopup::item:hover { background: #F8FAFA; color: #26343B; }
+QAbstractItemView#schedulerComboPopup::item:selected { background: #FFF1ED; color: #C94D3C; }
+QDialog#spacedRepetitionSettingsDialog QSpinBox::up-button, QDialog#spacedRepetitionSettingsDialog QDoubleSpinBox::up-button, QDialog#spacedRepetitionSettingsDialog QSpinBox::down-button, QDialog#spacedRepetitionSettingsDialog QDoubleSpinBox::down-button { background: #EEF2F3; border: none; border-left: 1px solid #D7DEE1; width: 24px; }
+QDialog#spacedRepetitionSettingsDialog QSpinBox::up-button, QDialog#spacedRepetitionSettingsDialog QDoubleSpinBox::up-button { border-top-right-radius: 7px; }
+QDialog#spacedRepetitionSettingsDialog QSpinBox::down-button, QDialog#spacedRepetitionSettingsDialog QDoubleSpinBox::down-button { border-bottom-right-radius: 7px; }
+QDialog#spacedRepetitionSettingsDialog QSpinBox::up-button:hover, QDialog#spacedRepetitionSettingsDialog QDoubleSpinBox::up-button:hover, QDialog#spacedRepetitionSettingsDialog QSpinBox::down-button:hover, QDialog#spacedRepetitionSettingsDialog QDoubleSpinBox::down-button:hover { background: #FFF1ED; }
+QDialog#spacedRepetitionSettingsDialog QPushButton[schedulerToggle="true"] { background: #FFFFFF; color: #66767D; border: 1px solid #D7DEE1; border-radius: 8px; padding: 8px 12px; font-size: 12px; font-weight: 600; }
+QDialog#spacedRepetitionSettingsDialog QPushButton[schedulerToggle="true"]:hover { background: #F8FAFA; color: #425159; border-color: #B7C5CA; }
+QDialog#spacedRepetitionSettingsDialog QPushButton[schedulerToggle="true"]:checked { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QDialog#spacedRepetitionSettingsDialog QPushButton[schedulerToggle="true"]:checked:hover { background: #FADFD9; color: #B44334; border-color: #DFA89F; }
+QLabel#retentionEffect { color: #66767D; font-size: 11px; }
+QLabel#retentionWarning { color: #9A5A16; background: #FFF6E8; border: none; border-radius: 7px; padding: 9px; }
+QLabel#schedulerInfoCallout { color: #536168; background: #F2F6F7; border: 1px solid #DCE5E7; border-radius: 7px; padding: 10px; }
+QPushButton#parametersToggle, QPushButton#resetFsrsParameters { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 8px; padding: 8px 12px; font-weight: 600; }
+QPushButton#parametersToggle:hover, QPushButton#resetFsrsParameters:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QPushButton#parametersToggle:checked { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QFrame#parametersPanel { background: #F7F9FA; border: 1px solid #E2E7E9; border-radius: 8px; }
+QDialog#spacedRepetitionSettingsDialog QDialogButtonBox QPushButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 8px; padding: 9px 16px; min-width: 88px; font-weight: 600; }
+QDialog#spacedRepetitionSettingsDialog QDialogButtonBox QPushButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QDialog#spacedRepetitionSettingsDialog QDialogButtonBox QPushButton:pressed { background: #FADFD9; color: #B44334; border-color: #E8B5AC; }
+QDialog#spacedRepetitionSettingsDialog QPushButton#schedulerSettingsSave { background: #E05945; color: #FFFFFF; border-color: #E05945; }
+QDialog#spacedRepetitionSettingsDialog QPushButton#schedulerSettingsSave:hover { background: #C94D3C; color: #FFFFFF; border-color: #C94D3C; }
+QDialog#spacedRepetitionSettingsDialog QPushButton#schedulerSettingsSave:pressed { background: #B44334; color: #FFFFFF; border-color: #B44334; }
 QLabel#cardListTitle { color: #182026; font-size: 20px; font-weight: 700; }
 QLabel#cardListCount { color: #6E7C83; font-size: 12px; }
 QTableWidget#cardListTable { background: #FFFFFF; color: #243139; gridline-color: #E1E6E8; border: 1px solid #DFE4E6; border-radius: 10px; outline: none; selection-background-color: #FFF1ED; selection-color: #C94D3C; }
@@ -1536,6 +1952,9 @@ QHeaderView::section { background: #EEF2F3; color: #526168; border: none; border
 QPushButton#cardListCloseButton { background: #E05945; color: #FFFFFF; border: none; border-radius: 9px; padding: 10px 20px; min-width: 90px; font-weight: 700; }
 QPushButton#cardListCloseButton:hover { background: #C94D3C; }
 QPushButton#cardListCloseButton:pressed { background: #B44334; }
+QPushButton#cardListResumeButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 10px 14px; font-weight: 600; }
+QPushButton#cardListResumeButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QPushButton#cardListResumeButton:disabled { background: #F2F4F5; color: #A8B1B5; }
 QDialog#manualCardDialog { background: #F7F9FA; }
 QLabel#manualCardTitle { color: #182026; font-size: 20px; font-weight: 700; }
 QLabel#manualCardSubtitle { color: #6E7C83; font-size: 12px; }
@@ -1590,6 +2009,23 @@ QPushButton#ratingEasy { background: #EAF5EE; color: #35704C; border: 1px solid 
 QScrollBar:vertical { background: transparent; width: 8px; margin: 5px 2px; }
 QScrollBar::handle:vertical { background: #CDD5D8; border-radius: 4px; min-height: 28px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+"""
+
+STYLESHEET += f"""
+QDialog#copybookCollectionDialog QSpinBox::up-arrow,
+QDialog#spacedRepetitionSettingsDialog QSpinBox::up-arrow,
+QDialog#spacedRepetitionSettingsDialog QDoubleSpinBox::up-arrow {{
+    image: url("{SPINBOX_PLUS_ICON.as_posix()}");
+    width: 10px;
+    height: 10px;
+}}
+QDialog#copybookCollectionDialog QSpinBox::down-arrow,
+QDialog#spacedRepetitionSettingsDialog QSpinBox::down-arrow,
+QDialog#spacedRepetitionSettingsDialog QDoubleSpinBox::down-arrow {{
+    image: url("{SPINBOX_MINUS_ICON.as_posix()}");
+    width: 10px;
+    height: 10px;
+}}
 """
 
 

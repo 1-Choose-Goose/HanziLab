@@ -1,13 +1,22 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from stroke_order import STROKE_DATA_DIR, load_character_data
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication
+
+from stroke_order import STROKE_DATA_DIR, StrokeOrderPanel, load_character_data
 
 
 class StrokeOrderDataTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
     def setUp(self):
         load_character_data.cache_clear()
         self.addCleanup(load_character_data.cache_clear)
@@ -46,6 +55,41 @@ class StrokeOrderDataTests(unittest.TestCase):
             for character in ("", "学习", "../学", "..\\学", "/", "\\"):
                 self.assertIsNone(load_character_data(character))
             open_file.assert_not_called()
+
+    def test_animation_draws_each_stroke_and_advances_automatically(self):
+        panel = StrokeOrderPanel("Times New Roman")
+        panel.set_word("学")
+        stroke_count = len(panel.canvas.data["strokes"])
+
+        self.assertFalse(hasattr(panel, "next_button"))
+        self.assertFalse(hasattr(panel, "play_button"))
+        self.assertTrue(panel.timer.isActive())
+        panel.timer.stop()
+        panel.animation_step()
+        self.assertEqual(panel.canvas.current_stroke, 0)
+        self.assertGreater(panel.canvas.stroke_progress, 0.0)
+        self.assertLess(panel.canvas.stroke_progress, 1.0)
+
+        for _step in range(10_000):
+            panel.animation_step()
+            if panel.loop_delay_remaining_ms > 0:
+                break
+
+        self.assertEqual(panel.canvas.current_stroke, stroke_count - 1)
+        self.assertEqual(panel.canvas.stroke_progress, 1.0)
+
+        while panel.loop_delay_remaining_ms > 0:
+            panel.animation_step()
+        self.assertEqual(panel.canvas.current_stroke, 0)
+        self.assertEqual(panel.canvas.stroke_progress, 0.0)
+
+        panel.set_word("你")
+        self.assertEqual(panel.canvas.character, "你")
+        self.assertEqual(panel.canvas.current_stroke, 0)
+        self.assertEqual(panel.canvas.stroke_progress, 0.0)
+        self.assertGreaterEqual(panel.canvas.current_stroke_duration_ms(), 480)
+        self.assertTrue(panel.timer.isActive())
+        panel.close()
 
 
 if __name__ == "__main__":

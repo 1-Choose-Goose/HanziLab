@@ -2,10 +2,18 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from scheduler import CardState, LearningState, Rating, ReviewDirection, preview_ratings
+from scheduler import (
+    CardState,
+    LearningState,
+    Rating,
+    ReviewDirection,
+    SchedulerConfig,
+    preview_ratings,
+)
 from study_database import (
     SCHEMA_VERSION,
     StudyRepository,
@@ -88,6 +96,16 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(set(ids[:10]), set(range(100, 110)))
         self.assertEqual(len(set(ids[10:]) & set(range(1, 46))), 20)
 
+    def test_new_card_limit_reserves_remaining_places_for_reviews(self):
+        due = [card(i, LearningState.REVIEW, NOW) for i in range(1, 10)]
+        new = [card(i) for i in range(100, 110)]
+        selected = select_daily_cards(
+            due + new, set(), 5, NOW, DeterministicRng(), new_limit=2
+        )
+        ids = [item.card_id for item in selected]
+        self.assertEqual(sum(item >= 100 for item in ids), 2)
+        self.assertEqual(sum(item < 100 for item in ids), 3)
+
     def test_due_learning_step_is_prioritized_before_completely_new(self):
         learning = card(50, LearningState.LEARNING, NOW)
         new = [card(i) for i in range(100, 140)]
@@ -111,6 +129,54 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(len(selected), 20)
         self.assertTrue(all(item.card_id >= 100 for item in selected[:5]))
         self.assertFalse({item.card_id for item in selected} & set(range(200, 300)))
+
+    def test_config_can_put_reviews_before_new_cards(self):
+        selected = select_daily_cards(
+            [card(10), card(1, LearningState.REVIEW, NOW)],
+            set(),
+            2,
+            NOW,
+            DeterministicRng(),
+            config=SchedulerConfig(new_review_order="reviews_first"),
+        )
+        self.assertEqual([item.card_id for item in selected], [1, 10])
+
+    def test_added_order_keeps_oldest_new_cards_first(self):
+        selected = select_daily_cards(
+            [card(3), card(1), card(2)],
+            set(),
+            3,
+            NOW,
+            DeterministicRng(),
+            config=SchedulerConfig(new_card_order="added"),
+        )
+        self.assertEqual([item.card_id for item in selected], [1, 2, 3])
+
+    def test_retrievability_order_puts_least_recallable_review_first(self):
+        recent = replace(
+            card(1, LearningState.REVIEW, NOW),
+            last_review_at=NOW - timedelta(days=2),
+        )
+        forgotten = replace(
+            card(2, LearningState.REVIEW, NOW),
+            last_review_at=NOW - timedelta(days=20),
+        )
+        selected = select_daily_cards(
+            [recent, forgotten],
+            set(),
+            2,
+            NOW,
+            DeterministicRng(),
+            config=SchedulerConfig(review_order="retrievability"),
+        )
+        self.assertEqual([item.card_id for item in selected], [2, 1])
+
+    def test_suspended_card_never_enters_daily_selection(self):
+        suspended = replace(card(1), is_suspended=True, priority_boost=True)
+        selected = select_daily_cards(
+            [suspended, card(2)], set(), 10, NOW, DeterministicRng()
+        )
+        self.assertEqual([item.card_id for item in selected], [2])
 
 
 class RepositoryIntegrationTests(unittest.TestCase):
@@ -194,7 +260,7 @@ class RepositoryIntegrationTests(unittest.TestCase):
         self.assertEqual(service.progress(third_time), (1, 30))
         stored = self.repository.get_card(first.card.id)
         self.assertEqual(stored.last_rating, Rating.HARD.value)
-        self.assertEqual(stored.next_review_at, third_time + timedelta(days=1))
+        self.assertEqual(stored.next_review_at, third_time + timedelta(minutes=6))
         self.assertEqual(self.repository.review_event_count(), 3)
 
     def test_pending_learning_card_is_not_duplicated_by_daily_due_queue(self):

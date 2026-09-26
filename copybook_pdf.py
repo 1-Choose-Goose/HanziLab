@@ -15,7 +15,6 @@ from PySide6.QtGui import (
     QPageLayout,
     QPageSize,
     QPainter,
-    QPainterPath,
     QPdfWriter,
     QPen,
 )
@@ -24,7 +23,6 @@ from PySide6.QtSvg import QSvgRenderer
 from stroke_order import load_character_data
 from text_formatting import is_cjk
 from xingshu_trajectories import (
-    CANVAS_SIZE,
     load_xingshu_trajectory,
     xingshu_font_family,
 )
@@ -40,7 +38,8 @@ GRID_COLUMNS = 15
 GRID_ROWS = 20
 CELLS_PER_PAGE = GRID_COLUMNS * GRID_ROWS
 OUTLINE_COLOR = QColor("#FF3300")
-GUIDE_COLOR = QColor("#FF6600")
+# Keep the inner writing guides behind traced and handwritten strokes.
+GUIDE_COLOR = QColor("#F8D4C8")
 SOLID_CHARACTER_COLOR = "#172126"
 TRACE_CHARACTER_COLOR = "#AAB2B5"
 
@@ -73,6 +72,45 @@ class _CopybookPage:
     stroke_groups: tuple[tuple[str, ...], ...]
     show_stroke_order: bool
     word_start_cell: int = 0
+
+
+@dataclass(frozen=True)
+class _AssemblyCell:
+    character: str
+    strokes: tuple[str, ...]
+    sequence_index: int
+
+
+def _assembled_cells(
+    entries: tuple[tuple[tuple[str, tuple[str, ...]], ...], ...],
+    row_spacing: int,
+    style: CopybookStyle | str = CopybookStyle.KAITI,
+) -> list[list[_AssemblyCell | None]]:
+    """Lay entries out on the grid, leaving full blank rows between them."""
+    selected_style = CopybookStyle(style)
+    pages: list[list[_AssemblyCell | None]] = []
+    cursor = 0
+    for entry_index, entry in enumerate(entries):
+        if entry_index:
+            occupied_rows = (cursor + GRID_COLUMNS - 1) // GRID_COLUMNS
+            cursor = (occupied_rows + row_spacing) * GRID_COLUMNS
+        for character, strokes in entry:
+            sequence_length = (
+                4
+                if selected_style is CopybookStyle.XINGSHU
+                else len(strokes) + 4
+            )
+            for sequence_index in range(sequence_length):
+                page_index, page_cell = divmod(cursor, CELLS_PER_PAGE)
+                while len(pages) <= page_index:
+                    pages.append([None] * CELLS_PER_PAGE)
+                pages[page_index][page_cell] = _AssemblyCell(
+                    character,
+                    strokes,
+                    sequence_index,
+                )
+                cursor += 1
+    return pages
 
 
 def hanzi_sequence(text: str) -> tuple[str, ...]:
@@ -120,7 +158,7 @@ def _draw_grid(painter: QPainter) -> None:
     outline_pen.setWidthF(1.1)
     outline_pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
     guide_pen = QPen(GUIDE_COLOR)
-    guide_pen.setWidthF(0.55)
+    guide_pen.setWidthF(0.40)
     guide_pen.setStyle(Qt.PenStyle.CustomDashLine)
     guide_pen.setDashPattern([4.0, 4.0])
 
@@ -151,26 +189,6 @@ def _draw_strokes(
     renderer.render(painter, target)
 
 
-def _trajectory_path(points: tuple[tuple[float, float], ...]) -> QPainterPath:
-    path = QPainterPath()
-    if not points:
-        return path
-    path.moveTo(points[0][0], points[0][1])
-    if len(points) == 2:
-        path.lineTo(points[1][0], points[1][1])
-        return path
-    for index in range(1, len(points) - 1):
-        current = points[index]
-        following = points[index + 1]
-        midpoint = (
-            (current[0] + following[0]) / 2.0,
-            (current[1] + following[1]) / 2.0,
-        )
-        path.quadTo(current[0], current[1], midpoint[0], midpoint[1])
-    path.lineTo(points[-1][0], points[-1][1])
-    return path
-
-
 def _draw_xingshu_character(
     painter: QPainter,
     cell_index: int,
@@ -189,37 +207,6 @@ def _draw_xingshu_character(
         painter.setPen(QColor(color))
         painter.setFont(font)
         painter.drawText(target, Qt.AlignmentFlag.AlignCenter, character)
-    finally:
-        painter.restore()
-
-
-def _draw_xingshu_strokes(
-    painter: QPainter,
-    cell_index: int,
-    character: str,
-    stroke_count: int,
-    *,
-    color: str = TRACE_CHARACTER_COLOR,
-    opacity: float,
-) -> None:
-    trajectory = load_xingshu_trajectory(character)
-    if not trajectory:
-        raise CopybookError(f"Нет траектории письма для: {character}")
-    target = _cell_rect(cell_index).adjusted(2.0, 2.0, -2.0, -2.0)
-    painter.save()
-    try:
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setOpacity(opacity)
-        painter.translate(target.left(), target.top())
-        painter.scale(target.width() / CANVAS_SIZE, target.height() / CANVAS_SIZE)
-        for stroke in trajectory.strokes[:stroke_count]:
-            pen = QPen(QColor(color))
-            pen.setWidthF(68.0)
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawPath(_trajectory_path(stroke))
     finally:
         painter.restore()
 
@@ -260,11 +247,7 @@ def _draw_xingshu_character_sequence(
     painter: QPainter,
     character: str,
 ) -> None:
-    """Draw one model, its ordered pen movements, and three trace models."""
-    trajectory = load_xingshu_trajectory(character)
-    if not trajectory:
-        raise CopybookError(f"Нет траектории письма для: {character}")
-    stroke_count = len(trajectory.strokes)
+    """Draw one XingShu model and three complete tracing copies."""
     _draw_xingshu_character(
         painter,
         0,
@@ -273,28 +256,10 @@ def _draw_xingshu_character_sequence(
         opacity=1.0,
     )
 
-    for stroke_index in range(stroke_count):
-        cell_index = stroke_index + 1
-        _draw_xingshu_character(
-            painter,
-            cell_index,
-            character,
-            color=TRACE_CHARACTER_COLOR,
-            opacity=0.12,
-        )
-        _draw_xingshu_strokes(
-            painter,
-            cell_index,
-            character,
-            stroke_index + 1,
-            opacity=0.48,
-        )
-
-    first_trace_cell = stroke_count + 1
     for offset in range(3):
         _draw_xingshu_character(
             painter,
-            first_trace_cell + offset,
+            1 + offset,
             character,
             color=TRACE_CHARACTER_COLOR,
             opacity=0.48,
@@ -347,6 +312,56 @@ def _draw_xingshu_word_sequence(
         )
 
 
+def _draw_assembly_cell(
+    painter: QPainter,
+    cell_index: int,
+    cell: _AssemblyCell,
+    style: CopybookStyle,
+) -> None:
+    if style is CopybookStyle.XINGSHU:
+        _draw_xingshu_character(
+            painter,
+            cell_index,
+            cell.character,
+            color=(
+                SOLID_CHARACTER_COLOR
+                if cell.sequence_index == 0
+                else TRACE_CHARACTER_COLOR
+            ),
+            opacity=1.0 if cell.sequence_index == 0 else 0.48,
+        )
+        return
+
+    stroke_count = len(cell.strokes)
+    if cell.sequence_index == 0:
+        _draw_strokes(
+            painter,
+            cell_index,
+            list(cell.strokes),
+            color=SOLID_CHARACTER_COLOR,
+            opacity=1.0,
+        )
+        return
+
+    if cell.sequence_index <= stroke_count:
+        _draw_strokes(
+            painter,
+            cell_index,
+            list(cell.strokes[: cell.sequence_index]),
+            color=TRACE_CHARACTER_COLOR,
+            opacity=0.48,
+        )
+        return
+
+    _draw_strokes(
+        painter,
+        cell_index,
+        list(cell.strokes),
+        color=TRACE_CHARACTER_COLOR,
+        opacity=0.48,
+    )
+
+
 def _write_copybook(
     path: Path,
     pages: list[_CopybookPage],
@@ -388,6 +403,35 @@ def _write_copybook(
         painter.end()
 
 
+def _write_assembled_copybook(
+    path: Path,
+    pages: list[list[_AssemblyCell | None]],
+    style: CopybookStyle,
+) -> None:
+    writer = QPdfWriter(str(path))
+    writer.setTitle(f"HanziLab - сборник прописей {style.display_name}")
+    writer.setCreator("HanziLab")
+    writer.setResolution(72)
+    writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+    writer.setPageMargins(QMarginsF(0, 0, 0, 0), QPageLayout.Unit.Point)
+
+    painter = QPainter(writer)
+    if not painter.isActive():
+        raise CopybookError("Не удалось открыть PDF для записи.")
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for page_index, page in enumerate(pages):
+            if page_index and not writer.newPage():
+                raise CopybookError("Не удалось добавить страницу в PDF.")
+            painter.fillRect(QRectF(0, 0, PAGE_WIDTH, PAGE_HEIGHT), QColor("#FFFFFF"))
+            _draw_grid(painter)
+            for cell_index, cell in enumerate(page):
+                if cell is not None:
+                    _draw_assembly_cell(painter, cell_index, cell, style)
+    finally:
+        painter.end()
+
+
 def generate_hanzi_copybook(
     text: str,
     output_path: str | Path,
@@ -413,9 +457,9 @@ def generate_hanzi_copybook(
         else:
             missing.append(character)
     if not strokes_by_character:
-        raise CopybookError(
-            "Для выбранного иероглифа нет данных о порядке черт."
-        )
+        if selected_style is CopybookStyle.XINGSHU:
+            raise CopybookError("Для выбранного иероглифа нет образца XingShu.")
+        raise CopybookError("Для выбранного иероглифа нет данных о порядке черт.")
 
     pages: list[_CopybookPage] = []
     word_page_added = len(sequence) >= 2 and all(
@@ -468,5 +512,81 @@ def generate_hanzi_copybook(
         characters=tuple(strokes_by_character),
         missing_characters=tuple(missing),
         word_page_added=word_page_added,
+        style=selected_style,
+    )
+
+
+def generate_assembled_copybook(
+    items: list[str] | tuple[str, ...],
+    output_path: str | Path,
+    *,
+    row_spacing: int = 3,
+    style: CopybookStyle | str = CopybookStyle.KAITI,
+) -> CopybookResult:
+    """Create one compact copybook from independently spaced words or hanzi."""
+    selected_style = CopybookStyle(style)
+    if not 0 <= row_spacing <= GRID_ROWS:
+        raise CopybookError("Отступ должен быть от 0 до 20 строк.")
+
+    sequences = [hanzi_sequence(item) for item in items]
+    sequences = [sequence for sequence in sequences if sequence]
+    if not sequences:
+        raise CopybookError("Добавьте в сборник хотя бы один иероглиф.")
+
+    characters = tuple(dict.fromkeys(character for sequence in sequences for character in sequence))
+    strokes_by_character: dict[str, tuple[str, ...]] = {}
+    missing: list[str] = []
+    for character in characters:
+        data = load_character_data(character)
+        strokes = tuple(data.get("strokes", [])) if data else ()
+        trajectory_available = (
+            selected_style is not CopybookStyle.XINGSHU
+            or load_xingshu_trajectory(character) is not None
+        )
+        if strokes and trajectory_available:
+            strokes_by_character[character] = strokes
+        else:
+            missing.append(character)
+
+    entries = tuple(
+        tuple(
+            (character, strokes_by_character[character])
+            for character in sequence
+            if character in strokes_by_character
+        )
+        for sequence in sequences
+    )
+    entries = tuple(entry for entry in entries if entry)
+    if not entries:
+        if selected_style is CopybookStyle.XINGSHU:
+            raise CopybookError("Для выбранных иероглифов нет образцов XingShu.")
+        raise CopybookError("Для выбранных иероглифов нет данных о порядке черт.")
+    pages = _assembled_cells(entries, row_spacing, selected_style)
+
+    target = Path(output_path).expanduser()
+    if target.suffix.lower() != ".pdf":
+        target = target.with_suffix(".pdf")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".hanzilab_",
+        suffix=".pdf",
+        dir=target.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        _write_assembled_copybook(temporary_path, pages, selected_style)
+        if temporary_path.stat().st_size < 1000:
+            raise CopybookError("Созданный PDF оказался пустым.")
+        os.replace(temporary_path, target)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+    return CopybookResult(
+        path=target,
+        characters=tuple(strokes_by_character),
+        missing_characters=tuple(missing),
+        word_page_added=False,
         style=selected_style,
     )

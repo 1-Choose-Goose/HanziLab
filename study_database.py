@@ -1,28 +1,35 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterable
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app_paths import USER_DATA_DIR
 
 from scheduler import (
+    DEFAULT_CONFIG,
     CardState,
     Rating,
     ReviewDirection,
     ScheduleOutcome,
+    SchedulerConfig,
     ensure_aware,
+    interval_for_stability,
     parse_datetime,
+    validate_config,
 )
 from text_formatting import normalize_display_text
 
 STUDY_DB_PATH = USER_DATA_DIR / "study.db"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 DEFAULT_DAILY_REVIEW_LIMIT = 30
+DEFAULT_NEW_CARDS_LIMIT = 30
 DAILY_SESSION_LIMIT_PREFIX = "daily_session_limit:"
 DAILY_BATCH_START_PREFIX = "daily_batch_start:"
+SCHEDULER_CONFIG_KEY = "scheduler_config_v1"
 
 
 CARD_COLUMNS: dict[str, str] = {
@@ -37,6 +44,8 @@ CARD_COLUMNS: dict[str, str] = {
     "learning_state": "TEXT NOT NULL DEFAULT 'NEW'",
     "learning_step": "INTEGER NOT NULL DEFAULT 0",
     "priority_boost": "INTEGER NOT NULL DEFAULT 0",
+    "is_leech": "INTEGER NOT NULL DEFAULT 0",
+    "is_suspended": "INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -116,6 +125,7 @@ def initialize_study_database(database: Path = STUDY_DB_PATH) -> None:
                 completed INTEGER NOT NULL DEFAULT 0,
                 selected_at TEXT NOT NULL,
                 completed_at TEXT,
+                was_new INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(local_date, card_id)
             );
             CREATE TABLE IF NOT EXISTS presentations (
@@ -153,6 +163,13 @@ def initialize_study_database(database: Path = STUDY_DB_PATH) -> None:
         for statement in schema.split(";"):
             if statement.strip():
                 connection.execute(statement)
+        daily_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(daily_cards)").fetchall()
+        }
+        if "was_new" not in daily_columns:
+            connection.execute(
+                "ALTER TABLE daily_cards ADD COLUMN was_new INTEGER NOT NULL DEFAULT 0"
+            )
         # Старые версии не запрещали несколько незавершённых показов/повторов
         # одной логической карточки. Оставляем самую свежую запись и закрепляем
         # инвариант частичными UNIQUE-индексами.
@@ -187,6 +204,10 @@ def initialize_study_database(database: Path = STUDY_DB_PATH) -> None:
         connection.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES ('daily_review_limit', ?)",
             (str(DEFAULT_DAILY_REVIEW_LIMIT),),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES ('new_cards_per_day', ?)",
+            (str(DEFAULT_NEW_CARDS_LIMIT),),
         )
         if current_version < 5:
             # Незавершённые повторы старой схемы уже имеют оценённую первую
@@ -377,18 +398,58 @@ class StudyRepository:
             rows = connection.execute("SELECT * FROM cards ORDER BY id").fetchall()
         return [CardState.from_mapping(dict(row)) for row in rows]
 
+    def set_card_suspended(self, card_id: int, suspended: bool) -> None:
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                "UPDATE cards SET is_suspended=? WHERE id=?",
+                (int(suspended), card_id),
+            )
+
     def get_daily_candidates(
-        self, date_key: str, now: datetime, limit: int
+        self, date_key: str, now: datetime, limit: int, new_limit: int | None = None
     ) -> list[CardState]:
         """Return only the highest-priority cards needed to fill today's queue."""
         if limit <= 0:
             return []
         with closing(self.connect()) as connection:
+            if new_limit is not None:
+                common = """
+                    FROM cards c
+                    WHERE c.is_suspended=0
+                      AND NOT EXISTS (
+                        SELECT 1 FROM daily_cards d
+                        WHERE d.local_date=? AND d.card_id=c.id
+                    )
+                      AND (
+                        c.priority_boost=1 OR c.learning_state='NEW'
+                        OR c.next_review_at IS NULL OR c.next_review_at <= ?
+                      )
+                """
+                non_new = connection.execute(
+                    "SELECT c.* " + common + """
+                      AND c.learning_state<>'NEW'
+                    ORDER BY CASE WHEN c.priority_boost=1 THEN 0
+                                  WHEN c.learning_state='LEARNING' THEN 1 ELSE 2 END,
+                             c.next_review_at, c.id
+                    LIMIT ?
+                    """,
+                    (date_key, to_storage(now), int(limit)),
+                ).fetchall()
+                new = connection.execute(
+                    "SELECT c.* " + common + """
+                      AND c.learning_state='NEW'
+                    ORDER BY c.priority_boost DESC, c.id
+                    LIMIT ?
+                    """,
+                    (date_key, to_storage(now), max(0, int(new_limit))),
+                ).fetchall()
+                return [CardState.from_mapping(dict(row)) for row in (*non_new, *new)]
             rows = connection.execute(
                 """
                 SELECT c.*
                 FROM cards c
-                WHERE NOT EXISTS (
+                WHERE c.is_suspended=0
+                  AND NOT EXISTS (
                     SELECT 1 FROM daily_cards d
                     WHERE d.local_date=? AND d.card_id=c.id
                 )
@@ -428,6 +489,103 @@ class StudyRepository:
             return max(1, int(row[0]))
         except (TypeError, ValueError):
             return DEFAULT_DAILY_REVIEW_LIMIT
+
+    def get_new_cards_limit(self) -> int:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT value FROM settings WHERE key='new_cards_per_day'"
+            ).fetchone()
+        try:
+            return max(0, int(row[0])) if row else DEFAULT_NEW_CARDS_LIMIT
+        except (TypeError, ValueError):
+            return DEFAULT_NEW_CARDS_LIMIT
+
+    def set_new_cards_limit(self, value: int) -> None:
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES ('new_cards_per_day', ?)",
+                (str(max(0, int(value))),),
+            )
+
+    def get_daily_new_count(self, date_key: str) -> int:
+        with closing(self.connect()) as connection:
+            return int(connection.execute(
+                "SELECT coalesce(sum(was_new), 0) FROM daily_cards WHERE local_date=?",
+                (date_key,),
+            ).fetchone()[0])
+
+    def get_scheduler_config(self) -> SchedulerConfig:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT value FROM settings WHERE key=?", (SCHEDULER_CONFIG_KEY,)
+            ).fetchone()
+        if row is None:
+            return DEFAULT_CONFIG
+        try:
+            payload = json.loads(row[0])
+            known = SchedulerConfig.__dataclass_fields__
+            values = {key: value for key, value in payload.items() if key in known}
+            for key in (
+                "fsrs_parameters", "learning_steps_seconds", "relearning_steps_seconds",
+                "easy_days_percentages",
+            ):
+                if key in values:
+                    values[key] = tuple(values[key])
+            config = SchedulerConfig(**values)
+            validate_config(config)
+            return config
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return DEFAULT_CONFIG
+
+    def set_scheduler_config(self, config: SchedulerConfig) -> None:
+        validate_config(config)
+        payload = {
+            name: getattr(config, name)
+            for name in SchedulerConfig.__dataclass_fields__
+        }
+        for key in (
+            "fsrs_parameters", "learning_steps_seconds", "relearning_steps_seconds",
+            "easy_days_percentages",
+        ):
+            payload[key] = list(getattr(config, key))
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+                (SCHEDULER_CONFIG_KEY, json.dumps(payload, ensure_ascii=False)),
+            )
+
+    def reschedule_review_cards(self, config: SchedulerConfig) -> int:
+        """Apply a new retention target/maximum to mature cards without losing history."""
+        validate_config(config)
+        changed: list[tuple[str, float, int]] = []
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT id, stability, last_review_at FROM cards
+                WHERE learning_state='REVIEW' AND stability>0
+                  AND last_review_at IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM presentations p
+                      WHERE p.card_id=cards.id AND p.completed_at IS NULL
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM direction_ratings r WHERE r.card_id=cards.id
+                  )
+                """
+            ).fetchall()
+        for row in rows:
+            reviewed = parse_datetime(row["last_review_at"])
+            if reviewed is None:
+                continue
+            days = interval_for_stability(float(row["stability"]), config)
+            changed.append((to_storage(reviewed + timedelta(days=days)), days, int(row["id"])))
+        if changed:
+            with closing(self.connect()) as connection, connection:
+                connection.executemany(
+                    "UPDATE cards SET next_review_at=?, current_interval_days=? WHERE id=?",
+                    changed,
+                )
+        return len(changed)
 
     def get_daily_session_limit(self, date_key: str) -> int:
         """Return today's possibly extended target without changing the preference."""
@@ -634,11 +792,13 @@ class StudyRepository:
             connection.executemany(
                 """
                 INSERT OR IGNORE INTO daily_cards
-                    (local_date, card_id, direction, position, selected_at)
-                VALUES (?, ?, ?, ?, ?)
+                    (local_date, card_id, direction, position, selected_at, was_new)
+                VALUES (?, ?, ?, ?, ?,
+                    (SELECT CASE WHEN learning_state='NEW' THEN 1 ELSE 0 END
+                     FROM cards WHERE id=?))
                 """,
                 [
-                    (date_key, card_id, direction, position, to_storage(selected_at))
+                    (date_key, card_id, direction, position, to_storage(selected_at), card_id)
                     for card_id, direction, position in rows
                 ],
             )
@@ -819,7 +979,7 @@ class StudyRepository:
                         difficulty=?, stability=?, last_review_at=?, next_review_at=?,
                         current_interval_days=?, review_count=?, lapse_count=?,
                         last_rating=?, learning_state=?, learning_step=?,
-                        priority_boost=0
+                        priority_boost=0, is_leech=?, is_suspended=?
                     WHERE id=?
                     """,
                     (
@@ -833,6 +993,8 @@ class StudyRepository:
                         card.last_rating,
                         card.learning_state.value,
                         card.learning_step,
+                        int(card.is_leech),
+                        int(card.is_suspended),
                         card.id,
                     ),
                 )

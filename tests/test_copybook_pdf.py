@@ -6,7 +6,6 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import call, patch
 
 from PySide6.QtPdf import QPdfDocument
@@ -14,12 +13,15 @@ from PySide6.QtWidgets import QApplication
 
 from copybook_pdf import (
     CELLS_PER_PAGE,
+    GRID_COLUMNS,
     CopybookError,
     CopybookStyle,
+    _assembled_cells,
     _draw_character_sequence,
     _draw_word_sequence,
     _draw_xingshu_character_sequence,
     _draw_xingshu_word_sequence,
+    generate_assembled_copybook,
     generate_hanzi_copybook,
     hanzi_sequence,
     suggested_copybook_name,
@@ -40,6 +42,43 @@ class CopybookPdfTests(unittest.TestCase):
             suggested_copybook_name("学习学", CopybookStyle.XINGSHU),
             "学习学_прописи_行书.pdf",
         )
+
+    def test_assembled_layout_counts_spacing_after_all_stroke_rows(self):
+        entries = (
+            (("学", tuple("1234567890")), ("习", tuple("12345"))),
+            (("人", tuple("12")),),
+        )
+        pages = _assembled_cells(entries, row_spacing=3)
+        occupied = [index for index, cell in enumerate(pages[0]) if cell is not None]
+        first_entry_size = (10 + 4) + (5 + 4)
+        self.assertEqual(occupied[:first_entry_size], list(range(first_entry_size)))
+        last_used_row = (first_entry_size - 1) // GRID_COLUMNS
+        expected_next = (last_used_row + 1 + 3) * GRID_COLUMNS
+        self.assertEqual(occupied[first_entry_size], expected_next)
+
+    def test_xingshu_assembled_layout_has_no_stroke_order_cells(self):
+        entries = (
+            (("学", tuple("12345678")), ("习", tuple("123"))),
+            (("人", tuple("12")),),
+        )
+        pages = _assembled_cells(
+            entries,
+            row_spacing=3,
+            style=CopybookStyle.XINGSHU,
+        )
+        occupied = [index for index, cell in enumerate(pages[0]) if cell is not None]
+        self.assertEqual(occupied[:8], list(range(8)))
+        self.assertEqual(occupied[8:], list(range(4 * GRID_COLUMNS, 4 * GRID_COLUMNS + 4)))
+
+    def test_generates_assembled_copybook(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "collection.pdf"
+            result = generate_assembled_copybook(
+                ["学习", "人"], output, row_spacing=2
+            )
+            self.assertEqual(result.path, output)
+            self.assertEqual(result.characters, ("学", "习", "人"))
+            self.assertGreater(output.stat().st_size, 10_000)
 
     def test_generates_word_page_and_one_page_per_unique_character(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -93,49 +132,18 @@ class CopybookPdfTests(unittest.TestCase):
             gc.collect()
             self.app.processEvents()
 
-    def test_xingshu_character_uses_one_trajectory_for_all_cells(self):
+    def test_xingshu_character_has_no_progressive_stroke_order(self):
         painter = object()
-        trajectory = SimpleNamespace(strokes=("movement-1", "movement-2"))
-        with (
-            patch(
-                "copybook_pdf.load_xingshu_trajectory",
-                return_value=trajectory,
-            ),
-            patch("copybook_pdf._draw_xingshu_character") as draw_character,
-            patch("copybook_pdf._draw_xingshu_strokes") as draw_strokes,
-        ):
+        with patch("copybook_pdf._draw_xingshu_character") as draw_character:
             _draw_xingshu_character_sequence(painter, "学")
 
         self.assertEqual(
-            draw_strokes.call_args_list,
-            [
-                call(
-                    painter,
-                    1,
-                    "学",
-                    1,
-                    opacity=0.48,
-                ),
-                call(
-                    painter,
-                    2,
-                    "学",
-                    2,
-                    opacity=0.48,
-                ),
-            ],
-        )
-        self.assertEqual(
             [item.args[1] for item in draw_character.call_args_list],
-            [0, 1, 2, 3, 4, 5],
+            [0, 1, 2, 3],
         )
         self.assertEqual(draw_character.call_args_list[0].kwargs["opacity"], 1.0)
         self.assertEqual(
-            [item.kwargs["opacity"] for item in draw_character.call_args_list[1:3]],
-            [0.12, 0.12],
-        )
-        self.assertEqual(
-            [item.kwargs["opacity"] for item in draw_character.call_args_list[3:]],
+            [item.kwargs["opacity"] for item in draw_character.call_args_list[1:]],
             [0.48, 0.48, 0.48],
         )
 
