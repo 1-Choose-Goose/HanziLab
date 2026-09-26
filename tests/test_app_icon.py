@@ -34,6 +34,15 @@ class AppIconTests(unittest.TestCase):
         self.assertIn((16, 16), sizes)
         self.assertIn((256, 256), sizes)
 
+    def test_macos_icon_has_standard_transparent_margin(self):
+        path = Path(__file__).parents[1] / "assets" / "icons" / "hanzilab-macos.png"
+        image = QImage(str(path))
+        self.assertFalse(image.isNull())
+        self.assertEqual((image.width(), image.height()), (1024, 1024))
+        self.assertEqual(image.pixelColor(0, 0).alpha(), 0)
+        self.assertEqual(image.pixelColor(99, 512).alpha(), 0)
+        self.assertGreater(image.pixelColor(110, 512).alpha(), 0)
+
     def test_main_window_and_sidebar_use_hanzi_xingshu_brand(self):
         with tempfile.TemporaryDirectory() as folder:
             repository = StudyRepository(Path(folder) / "study.db")

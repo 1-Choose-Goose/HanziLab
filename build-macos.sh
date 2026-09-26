@@ -16,9 +16,14 @@ for required_file in dictionary-server.json dictionary-server-ca.pem; do
 done
 
 ICON="assets/icons/hanzilab.icns"
+MACOS_ICON_SOURCE="assets/icons/hanzilab-macos.png"
 # Recent macOS releases can reject otherwise valid hand-built iconsets. Let
-# the system image service create the ICNS container directly instead.
-sips -s format icns assets/icons/hanzilab.png --out "$ICON" >/dev/null
+# the system image service create the ICNS container directly instead. Its
+# ICNS converter expects a 256 px source even though we keep a 1024 px master.
+ICON_TEMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$ICON_TEMP_DIR"' EXIT
+sips -z 256 256 "$MACOS_ICON_SOURCE" --out "$ICON_TEMP_DIR/hanzilab.png" >/dev/null
+sips -s format icns "$ICON_TEMP_DIR/hanzilab.png" --out "$ICON" >/dev/null
 
 python3 -m PyInstaller --noconfirm --clean HanziLab.spec
 
