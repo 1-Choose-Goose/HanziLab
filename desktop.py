@@ -74,7 +74,9 @@ from text_formatting import (
 APP_TITLE = "HanziLab — китайско-русский словарь"
 FONT_DIR = RESOURCE_ROOT / "assets" / "fonts"
 ICON_DIR = RESOURCE_ROOT / "assets" / "icons"
-APP_ICON_PNG = ICON_DIR / "hanzilab.png"
+APP_ICON_PNG = ICON_DIR / (
+    "hanzilab-macos.png" if sys.platform == "darwin" else "hanzilab.png"
+)
 APP_ICON_ICO = ICON_DIR / "hanzilab.ico"
 SPINBOX_PLUS_ICON = ICON_DIR / "spinbox-plus.svg"
 SPINBOX_MINUS_ICON = ICON_DIR / "spinbox-minus.svg"

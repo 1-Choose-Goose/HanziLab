@@ -1,4 +1,5 @@
 import os
+import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -21,9 +22,10 @@ class AppIconTests(unittest.TestCase):
         desktop.load_chinese_fonts()
 
     def test_png_and_multisize_windows_icon_are_valid(self):
+        generic_png = desktop.ICON_DIR / "hanzilab.png"
         self.assertTrue(desktop.APP_ICON_PNG.is_file())
         self.assertTrue(desktop.APP_ICON_ICO.is_file())
-        image = QImage(str(desktop.APP_ICON_PNG))
+        image = QImage(str(generic_png))
         self.assertFalse(image.isNull())
         self.assertEqual((image.width(), image.height()), (256, 256))
         self.assertEqual(image.pixelColor(0, 0).alpha(), 0)
@@ -42,6 +44,8 @@ class AppIconTests(unittest.TestCase):
         self.assertEqual(image.pixelColor(0, 0).alpha(), 0)
         self.assertEqual(image.pixelColor(99, 512).alpha(), 0)
         self.assertGreater(image.pixelColor(110, 512).alpha(), 0)
+        if sys.platform == "darwin":
+            self.assertEqual(desktop.APP_ICON_PNG, path)
 
     def test_main_window_and_sidebar_use_hanzi_xingshu_brand(self):
         with tempfile.TemporaryDirectory() as folder:
