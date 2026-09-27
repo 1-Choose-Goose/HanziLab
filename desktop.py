@@ -1111,7 +1111,7 @@ class HanziLabWindow(QMainWindow):
         layout.addWidget(font_label)
         self.font_selector = QComboBox()
         self.font_selector.setObjectName("fontSelector")
-        self.font_selector.setFixedHeight(38)
+        self.font_selector.setFixedHeight(36)
         self.font_selector.addItem("KaiTi · 楷体", KAITI_FAMILY)
         self.font_selector.addItem("XingShu · 行书", XINGSHU_FAMILY)
         center_combo_box_text(self.font_selector)
@@ -1144,7 +1144,7 @@ class HanziLabWindow(QMainWindow):
 
         self.dictionary_source_selector = QComboBox()
         self.dictionary_source_selector.setObjectName("dictionarySource")
-        self.dictionary_source_selector.setFixedHeight(38)
+        self.dictionary_source_selector.setFixedHeight(36)
         self.dictionary_source_selector.addItem("Серверная база", "server")
         self.dictionary_source_selector.addItem("Локальная база", "local")
         center_combo_box_text(self.dictionary_source_selector)
@@ -1165,7 +1165,7 @@ class HanziLabWindow(QMainWindow):
             else "Скачать базу"
         )
         self.download_dictionary_button.setObjectName("downloadDictionary")
-        self.download_dictionary_button.setFixedHeight(38)
+        self.download_dictionary_button.setFixedHeight(36)
         self.download_dictionary_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.download_dictionary_button.clicked.connect(self.start_dictionary_download)
         layout.addWidget(self.download_dictionary_button)
@@ -2074,7 +2074,7 @@ QComboBox#fontSelector:hover, QComboBox#dictionarySource:hover { border-color: #
 QComboBox#fontSelector::drop-down, QComboBox#dictionarySource::drop-down { border: none; width: 24px; }
 QComboBox#fontSelector QAbstractItemView, QComboBox#dictionarySource QAbstractItemView { background: #17262C; color: #EAF0F2; border: 1px solid #2A3C43; padding: 3px; font-size: 13px; selection-background-color: #E05945; outline: none; }
 QComboBox#fontSelector QAbstractItemView::item, QComboBox#dictionarySource QAbstractItemView::item { min-height: 28px; padding: 3px 8px; }
-QPushButton#downloadDictionary { background: transparent; color: #D6E0E3; border: 1px solid #354A52; border-radius: 9px; padding: 9px 10px; min-height: 18px; font-size: 12px; font-weight: 600; }
+QPushButton#downloadDictionary { background: transparent; color: #D6E0E3; border: 1px solid #354A52; border-radius: 9px; padding: 7px 10px; font-size: 11px; font-weight: 600; }
 QPushButton#downloadDictionary:hover { background: #24343A; border-color: #526A73; color: #FFFFFF; }
 QPushButton#downloadDictionary:disabled { color: #71838B; border-color: #293B42; }
 QWidget#content { background: #F4F6F8; }
