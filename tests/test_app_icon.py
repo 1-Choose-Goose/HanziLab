@@ -101,6 +101,14 @@ class AppIconTests(unittest.TestCase):
         self.assertIn("BUNDLE", spec)
         self.assertIn("io.github.choose-goose.hanzilab", spec)
 
+    def test_message_dialogs_use_the_application_palette(self):
+        self.assertIn(
+            "QMessageBox, QProgressDialog { background: #F7F9FA;",
+            desktop.STYLESHEET,
+        )
+        self.assertIn("QMessageBox QPushButton:hover", desktop.STYLESHEET)
+        self.assertIn("QProgressDialog QProgressBar::chunk", desktop.STYLESHEET)
+
     def test_window_title_is_not_duplicated_by_display_name(self):
         source = (Path(__file__).parents[1] / "desktop.py").read_text(
             encoding="utf-8"

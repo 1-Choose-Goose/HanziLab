@@ -1962,6 +1962,14 @@ class HanziLabWindow(QMainWindow):
 
 STYLESHEET = """
 QWidget#root { background: #F4F6F8; color: #182026; }
+QMessageBox, QProgressDialog { background: #F7F9FA; color: #182026; }
+QMessageBox QLabel, QProgressDialog QLabel { background: transparent; color: #344149; font-size: 13px; }
+QMessageBox QPushButton, QProgressDialog QPushButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 8px; padding: 8px 18px; min-width: 76px; font-size: 12px; font-weight: 600; }
+QMessageBox QPushButton:hover, QProgressDialog QPushButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QMessageBox QPushButton:pressed, QProgressDialog QPushButton:pressed { background: #FADFD9; color: #B44334; border-color: #E2A297; }
+QMessageBox QTextEdit { background: #FFFFFF; color: #425159; border: 1px solid #DDE4E6; border-radius: 8px; padding: 7px; selection-background-color: #FADFD9; selection-color: #7A3027; }
+QProgressDialog QProgressBar { background: #E8EDEF; color: #344149; border: none; border-radius: 6px; text-align: center; min-height: 12px; }
+QProgressDialog QProgressBar::chunk { background: #E05945; border-radius: 6px; }
 QFrame#sidebar { background: #111D22; border: none; }
 QLabel#seal { background: #E05945; color: white; border-radius: 10px; }
 QLabel#brandName { color: #F7FAF9; font-size: 18px; font-weight: 700; }

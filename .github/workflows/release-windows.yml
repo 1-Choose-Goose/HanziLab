@@ -23,12 +23,14 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-build.txt
 
-      - name: Restore private server configuration
-        if: ${{ secrets.DICTIONARY_SERVER_JSON_B64 != '' }}
+      - name: Restore optional server configuration
         shell: pwsh
         env:
           SERVER_CONFIG: ${{ secrets.DICTIONARY_SERVER_JSON_B64 }}
-        run: '[IO.File]::WriteAllBytes("dictionary-server.json", [Convert]::FromBase64String($env:SERVER_CONFIG))'
+        run: |
+          if ($env:SERVER_CONFIG) {
+            [IO.File]::WriteAllBytes("dictionary-server.json", [Convert]::FromBase64String($env:SERVER_CONFIG))
+          }
 
       - name: Verify tag matches application version
         if: github.event_name == 'push'
