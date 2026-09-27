@@ -120,6 +120,21 @@ def exec_message_box(dialog: QMessageBox) -> int:
     return dialog.exec()
 
 
+def center_combo_box_text(combo: QComboBox) -> None:
+    combo.setEditable(True)
+    editor = combo.lineEdit()
+    if editor is not None:
+        editor.setReadOnly(True)
+        editor.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        editor.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    for index in range(combo.count()):
+        combo.setItemData(
+            index,
+            Qt.AlignmentFlag.AlignCenter,
+            Qt.ItemDataRole.TextAlignmentRole,
+        )
+
+
 class BackgroundTaskSignals(QObject):
     finished = Signal(int, object, object)
 
@@ -585,9 +600,11 @@ class CopybookCollectionDialog(QDialog):
         actions.addStretch()
         cancel_button = QPushButton("Отмена")
         cancel_button.setObjectName("collectionCancelButton")
+        cancel_button.setFixedSize(120, 42)
         cancel_button.clicked.connect(self.reject)
         self.generate_button = QPushButton("Создать PDF")
         self.generate_button.setObjectName("collectionPrimaryButton")
+        self.generate_button.setFixedSize(120, 42)
         self.generate_button.setEnabled(False)
         self.generate_button.clicked.connect(self.create_pdf)
         actions.addWidget(cancel_button)
@@ -1089,11 +1106,13 @@ class HanziLabWindow(QMainWindow):
 
         font_label = QLabel("ШРИФТ ИЕРОГЛИФОВ")
         font_label.setObjectName("sidebarSection")
+        font_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(font_label)
         self.font_selector = QComboBox()
         self.font_selector.setObjectName("fontSelector")
         self.font_selector.addItem("KaiTi · 楷体", KAITI_FAMILY)
         self.font_selector.addItem("XingShu · 行书", XINGSHU_FAMILY)
+        center_combo_box_text(self.font_selector)
         selected_index = self.font_selector.findData(self.hanzi_font_family)
         self.font_selector.setCurrentIndex(max(selected_index, 0))
         self.font_selector.currentIndexChanged.connect(self.change_hanzi_font)
@@ -1102,6 +1121,7 @@ class HanziLabWindow(QMainWindow):
 
         database_label = QLabel("БАЗА СЛОВАРЯ")
         database_label.setObjectName("sidebarSection")
+        database_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(database_label)
 
         self.dictionary_entries: int | None = None
@@ -1112,8 +1132,10 @@ class HanziLabWindow(QMainWindow):
         status_layout.setSpacing(7)
         self.dictionary_status_title = QLabel()
         self.dictionary_status_title.setObjectName("dictionaryStatusTitle")
+        self.dictionary_status_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.dictionary_status = QLabel()
         self.dictionary_status.setObjectName("dictionaryStatusDetails")
+        self.dictionary_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         status_layout.addWidget(self.dictionary_status_title)
         status_layout.addWidget(self.dictionary_status)
         layout.addWidget(status_panel)
@@ -1122,6 +1144,7 @@ class HanziLabWindow(QMainWindow):
         self.dictionary_source_selector.setObjectName("dictionarySource")
         self.dictionary_source_selector.addItem("Серверная база", "server")
         self.dictionary_source_selector.addItem("Локальная база", "local")
+        center_combo_box_text(self.dictionary_source_selector)
         local_item = self.dictionary_source_selector.model().item(1)
         if local_item is not None:
             local_item.setEnabled(database.FULL_DB_PATH.exists())
@@ -2042,6 +2065,7 @@ QLabel#dictionaryStatusTitle { color: #83949B; font-size: 12px; background: tran
 QLabel#dictionaryStatusDetails { color: #B3C1C7; font-size: 13px; background: transparent; }
 QComboBox#fontSelector { background: #17262C; color: #D8E1E4; border: 1px solid #2A3C43; border-radius: 9px; padding: 9px 11px; font-size: 12px; }
 QComboBox#dictionarySource { background: #17262C; color: #D8E1E4; border: 1px solid #2A3C43; border-radius: 9px; padding: 8px 10px; font-size: 11px; }
+QComboBox#fontSelector QLineEdit, QComboBox#dictionarySource QLineEdit { background: transparent; color: #D8E1E4; border: none; padding: 0; }
 QComboBox#fontSelector:hover, QComboBox#dictionarySource:hover { border-color: #496069; }
 QComboBox#fontSelector::drop-down, QComboBox#dictionarySource::drop-down { border: none; width: 24px; }
 QComboBox#fontSelector QAbstractItemView, QComboBox#dictionarySource QAbstractItemView { background: #17262C; color: #EAF0F2; border: 1px solid #2A3C43; selection-background-color: #E05945; outline: none; }

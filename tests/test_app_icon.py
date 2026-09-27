@@ -78,6 +78,22 @@ class AppIconTests(unittest.TestCase):
             self.assertEqual(developer.text(), "Choose_Goose")
             self.assertIn(desktop.APP_VERSION, version.text())
             self.assertEqual(update_button.text(), "Проверить обновления")
+            self.assertEqual(
+                window.font_selector.lineEdit().alignment(),
+                Qt.AlignmentFlag.AlignCenter,
+            )
+            self.assertEqual(
+                window.dictionary_source_selector.lineEdit().alignment(),
+                Qt.AlignmentFlag.AlignCenter,
+            )
+            self.assertEqual(
+                window.dictionary_status_title.alignment(),
+                Qt.AlignmentFlag.AlignCenter,
+            )
+            self.assertEqual(
+                window.dictionary_status.alignment(),
+                Qt.AlignmentFlag.AlignCenter,
+            )
             links = contacts.findChildren(QLabel, "aboutContactLink")
             self.assertEqual(len(links), 3)
             for link, contact in zip(
