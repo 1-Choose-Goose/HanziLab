@@ -2069,7 +2069,8 @@ QComboBox#dictionarySource { background: #17262C; color: #D8E1E4; border: 1px so
 QComboBox#fontSelector QLineEdit, QComboBox#dictionarySource QLineEdit { background: transparent; color: #D8E1E4; border: none; padding: 0; }
 QComboBox#fontSelector:hover, QComboBox#dictionarySource:hover { border-color: #496069; }
 QComboBox#fontSelector::drop-down, QComboBox#dictionarySource::drop-down { border: none; width: 24px; }
-QComboBox#fontSelector QAbstractItemView, QComboBox#dictionarySource QAbstractItemView { background: #17262C; color: #EAF0F2; border: 1px solid #2A3C43; selection-background-color: #E05945; outline: none; }
+QComboBox#fontSelector QAbstractItemView, QComboBox#dictionarySource QAbstractItemView { background: #17262C; color: #EAF0F2; border: 1px solid #2A3C43; padding: 3px; font-size: 13px; selection-background-color: #E05945; outline: none; }
+QComboBox#fontSelector QAbstractItemView::item, QComboBox#dictionarySource QAbstractItemView::item { min-height: 28px; padding: 3px 8px; }
 QPushButton#downloadDictionary { background: transparent; color: #D6E0E3; border: 1px solid #354A52; border-radius: 9px; padding: 8px 10px; font-size: 11px; }
 QPushButton#downloadDictionary:hover { background: #24343A; border-color: #526A73; color: #FFFFFF; }
 QPushButton#downloadDictionary:disabled { color: #71838B; border-color: #293B42; }
