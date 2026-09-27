@@ -9,7 +9,6 @@ from typing import Protocol
 
 import genanki
 
-
 DIRECT_MODEL_ID = 1938475622
 REVERSE_MODEL_ID = 1938475623
 DECK_ID = 2059440712

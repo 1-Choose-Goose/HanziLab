@@ -19,7 +19,10 @@ if ($foreignIcu) {
 
 $dataDirectory = Join-Path $PSScriptRoot "dist\HanziLab\data"
 foreach ($configFile in @("dictionary-server.json", "dictionary-server-ca.pem")) {
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $configFile) -Destination (Join-Path $PSScriptRoot "dist\HanziLab\$configFile") -Force
+    $source = Join-Path $PSScriptRoot $configFile
+    if (Test-Path -LiteralPath $source) {
+        Copy-Item -LiteralPath $source -Destination (Join-Path $PSScriptRoot "dist\HanziLab\$configFile") -Force
+    }
 }
 New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
 

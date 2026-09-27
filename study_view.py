@@ -758,10 +758,13 @@ class SpacedRepetitionSettingsDialog(QDialog):
         easy_days_grid.setContentsMargins(0, 3, 0, 0)
         easy_days_grid.setHorizontalSpacing(8)
         self.easy_day_controls = []
-        for index, (day, value) in enumerate(zip(
-            ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"),
-            self.config.easy_days_percentages,
-        )):
+        for index, (day, value) in enumerate(
+            zip(
+                ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"),
+                self.config.easy_days_percentages,
+                strict=True,
+            )
+        ):
             grid_column = (index % 4) * 2 + (1 if index >= 4 else 0)
             grid_row = (index // 4) * 2
             label = QLabel(day)
@@ -1086,7 +1089,7 @@ class SpacedRepetitionSettingsDialog(QDialog):
             max(0, self.leech_action.findData(defaults.leech_action))
         )
         for control, value in zip(
-            self.easy_day_controls, defaults.easy_days_percentages
+            self.easy_day_controls, defaults.easy_days_percentages, strict=True
         ):
             control.setCurrentIndex(max(0, control.findData(value)))
         self.learning_steps.setText(self._format_steps(defaults.learning_steps_seconds))

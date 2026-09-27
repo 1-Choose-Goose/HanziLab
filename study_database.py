@@ -8,7 +8,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app_paths import USER_DATA_DIR
-
 from scheduler import (
     DEFAULT_CONFIG,
     CardState,

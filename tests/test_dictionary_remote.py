@@ -1,17 +1,26 @@
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
 import database
 import dictionary_remote
 import dictionary_server
+from scripts.dictionary_schema import create_dictionary_schema
 
 
 class RemoteDictionaryTests(unittest.TestCase):
+    @staticmethod
+    def dictionary_bytes(path: Path) -> bytes:
+        with closing(sqlite3.connect(path)) as connection, connection:
+            create_dictionary_schema(connection)
+        return path.read_bytes()
+
     def test_frozen_app_finds_configuration_in_bundled_resources(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -78,12 +87,30 @@ class RemoteDictionaryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as folder:
             destination = Path(folder) / "data" / "hanzi.db"
-            response = Response(b"SQLite format 3\x00payload")
+            payload = self.dictionary_bytes(Path(folder) / "source.db")
+            response = Response(payload)
             config = {"download": {"provider": "yandex_disk", "public_url": "https://disk.yandex.ru/d/test", "password": "secret"}}
             with patch.object(dictionary_remote, "configuration", return_value=config), patch.object(dictionary_remote, "_resolve_yandex_download", return_value="https://downloader.test/hanzi.db"), patch.object(dictionary_remote, "urlopen", return_value=response):
                 result = dictionary_remote.download_dictionary(destination)
             self.assertEqual(result, destination)
-            self.assertEqual(destination.read_bytes(), b"SQLite format 3\x00payload")
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertFalse(destination.with_name("hanzi.db.download").exists())
+
+    def test_download_rejects_header_only_database_and_preserves_installed_file(self):
+        class Response(io.BytesIO):
+            def __init__(self, value: bytes):
+                super().__init__(value)
+                self.headers = {"Content-Length": str(len(value))}
+
+        with tempfile.TemporaryDirectory() as folder:
+            destination = Path(folder) / "data" / "hanzi.db"
+            destination.parent.mkdir()
+            destination.write_bytes(b"existing dictionary")
+            response = Response(b"SQLite format 3\x00payload")
+            config = {"download": {"provider": "yandex_disk", "public_url": "https://disk.yandex.ru/d/test", "password": "secret"}}
+            with patch.object(dictionary_remote, "configuration", return_value=config), patch.object(dictionary_remote, "_resolve_yandex_download", return_value="https://downloader.test/hanzi.db"), patch.object(dictionary_remote, "urlopen", return_value=response), self.assertRaisesRegex(RuntimeError, "повреждённый"):
+                dictionary_remote.download_dictionary(destination)
+            self.assertEqual(destination.read_bytes(), b"existing dictionary")
             self.assertFalse(destination.with_name("hanzi.db.download").exists())
 
     def test_download_resumes_an_existing_partial_file(self):
@@ -98,20 +125,25 @@ class RemoteDictionaryTests(unittest.TestCase):
             destination = Path(folder) / "data" / "hanzi.db"
             destination.parent.mkdir()
             partial = destination.with_name("hanzi.db.download")
-            partial.write_bytes(b"SQLite format 3\x00part")
-            response = Response(b"ial")
+            payload = self.dictionary_bytes(Path(folder) / "source.db")
+            split_at = len(payload) // 2
+            partial.write_bytes(payload[:split_at])
+            response = Response(payload[split_at:])
             config = {"download": {"provider": "yandex_disk", "public_url": "https://disk.yandex.ru/d/test", "password": "secret"}}
             with patch.object(dictionary_remote, "configuration", return_value=config), patch.object(dictionary_remote, "_resolve_yandex_download", return_value="https://downloader.test/hanzi.db"), patch.object(dictionary_remote, "urlopen", return_value=response) as open_url:
                 dictionary_remote.download_dictionary(destination)
-            self.assertEqual(destination.read_bytes(), b"SQLite format 3\x00partial")
+            self.assertEqual(destination.read_bytes(), payload)
             self.assertEqual(
                 open_url.call_args.args[0].get_header("Range"),
-                f"bytes={len(b'SQLite format 3') + 5}-",
+                f"bytes={split_at}-",
             )
 
     def test_download_reconnects_and_resumes_after_network_interruption(self):
-        first_part = b"SQLite format 3\x00part"
-        second_part = b"ial"
+        with tempfile.TemporaryDirectory() as payload_folder:
+            payload = self.dictionary_bytes(Path(payload_folder) / "source.db")
+        split_at = len(payload) // 2
+        first_part = payload[:split_at]
+        second_part = payload[split_at:]
         total = len(first_part) + len(second_part)
 
         class InterruptedResponse(io.BytesIO):
@@ -166,7 +198,7 @@ class RemoteDictionaryTests(unittest.TestCase):
             ):
                 dictionary_remote.download_dictionary(destination)
 
-            self.assertEqual(destination.read_bytes(), first_part + second_part)
+            self.assertEqual(destination.read_bytes(), payload)
             self.assertEqual(resolve.call_count, 2)
             self.assertEqual(open_url.call_count, 2)
             self.assertEqual(

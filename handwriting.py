@@ -91,16 +91,16 @@ def _stroke_center(stroke: bytes) -> tuple[float, float]:
 
 def _distance(first: tuple[bytes, ...], second: tuple[bytes, ...]) -> float:
     ordered = sum(
-        sum((left - right) ** 2 for left, right in zip(a, b))
-        for a, b in zip(first, second)
+        sum((left - right) ** 2 for left, right in zip(a, b, strict=True))
+        for a, b in zip(first, second, strict=True)
     )
     # A spatial comparison keeps recognition useful when a learner draws the
     # correct lines in a slightly different order.
     spatial_first = sorted(first, key=_stroke_center)
     spatial_second = sorted(second, key=_stroke_center)
     spatial = sum(
-        sum((left - right) ** 2 for left, right in zip(a, b))
-        for a, b in zip(spatial_first, spatial_second)
+        sum((left - right) ** 2 for left, right in zip(a, b, strict=True))
+        for a, b in zip(spatial_first, spatial_second, strict=True)
     )
     return ordered * 0.68 + spatial * 0.32
 

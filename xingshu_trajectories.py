@@ -112,7 +112,9 @@ def _thinning_pass(image: np.ndarray, second: bool) -> bool:
     count = sum(item.astype(np.uint8) for item in adjacent)
     transitions = sum(
         ((first == 0) & (following == 1)).astype(np.uint8)
-        for first, following in zip(adjacent, adjacent[1:] + adjacent[:1])
+        for first, following in zip(
+            adjacent, adjacent[1:] + adjacent[:1], strict=True
+        )
     )
     north, _north_east, east, _south_east, south, _south_west, west, _north_west = adjacent
     if second:

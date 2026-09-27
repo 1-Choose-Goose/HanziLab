@@ -8,7 +8,6 @@ import unicodedata
 from functools import cache
 from pathlib import Path
 
-from app_paths import RESOURCE_ROOT
 from pypinyin import Style, lazy_pinyin
 from PySide6.QtCore import (
     QEvent,
@@ -49,6 +48,7 @@ from PySide6.QtWidgets import (
 
 import database
 import dictionary_remote
+from app_paths import RESOURCE_ROOT
 from copybook_pdf import (
     CopybookError,
     CopybookStyle,

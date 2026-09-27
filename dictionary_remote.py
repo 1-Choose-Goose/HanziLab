@@ -5,10 +5,12 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import ssl
 import sys
 import threading
 import time
+from contextlib import closing
 from functools import lru_cache
 from http.client import HTTPException, HTTPSConnection
 from http.cookiejar import CookieJar
@@ -27,10 +29,15 @@ import certifi
 
 from app_paths import RESOURCE_ROOT
 
-
 SOURCE_ROOT = Path(__file__).resolve().parent
 EXECUTABLE_ROOT = Path(sys.executable).resolve().parent
 _THREAD_CONNECTION = threading.local()
+_REQUIRED_DICTIONARY_TABLES = {
+    "entries",
+    "entries_fts",
+    "examples",
+    "examples_fts",
+}
 
 
 def configuration_path() -> Path:
@@ -112,7 +119,13 @@ def call(operation: str, **parameters):
     for attempt in range(2):
         try:
             return _post_json(url, config["token"], operation, parameters, context)
-        except (HTTPException, URLError, TimeoutError, OSError, ValueError) as error:
+        except (
+            HTTPException,
+            URLError,
+            TimeoutError,
+            OSError,
+            ValueError,
+        ) as error:
             holder = getattr(_THREAD_CONNECTION, "holder", None)
             if holder is not None:
                 holder[1].close()
@@ -185,6 +198,35 @@ def _resolve_yandex_download(public_url: str, password: str, context) -> str:
     return download_url
 
 
+def _validate_dictionary_file(path: Path) -> None:
+    """Reject truncated SQLite files and databases with an incompatible schema."""
+    try:
+        uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            missing = _REQUIRED_DICTIONARY_TABLES - tables
+            if missing:
+                raise RuntimeError("Яндекс Диск вернул повреждённый файл словаря.")
+            # Preparing and stepping each query also verifies the columns and
+            # the root pages used by normal dictionary operations.
+            connection.execute(
+                "SELECT hanzi, pinyin, translation FROM entries LIMIT 1"
+            ).fetchone()
+            connection.execute(
+                "SELECT chinese, pinyin, translation FROM examples LIMIT 1"
+            ).fetchone()
+            connection.execute("SELECT rowid FROM entries_fts LIMIT 1").fetchone()
+            connection.execute("SELECT rowid FROM examples_fts LIMIT 1").fetchone()
+    except sqlite3.Error as error:
+        raise RuntimeError("Яндекс Диск вернул повреждённый файл словаря.") from error
+
+
 def download_dictionary(destination: Path, progress=None, cancelled=None) -> Path:
     """Atomically download the shared SQLite database for offline use."""
     config = configuration()
@@ -249,6 +291,7 @@ def download_dictionary(destination: Path, progress=None, cancelled=None) -> Pat
                     raise RuntimeError(
                         "Яндекс Диск вернул повреждённый файл словаря."
                     )
+            _validate_dictionary_file(temporary)
             temporary.replace(destination)
             return destination
         except RuntimeError as error:
@@ -257,6 +300,8 @@ def download_dictionary(destination: Path, progress=None, cancelled=None) -> Pat
                 "Недостаточно места: для локального словаря нужно около 2,5 ГБ.",
                 "Яндекс Диск вернул повреждённый файл словаря.",
             }:
+                if "повреждённый" in str(error):
+                    temporary.unlink(missing_ok=True)
                 raise
             last_error = error
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:

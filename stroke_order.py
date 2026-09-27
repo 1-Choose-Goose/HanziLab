@@ -152,7 +152,7 @@ class StrokeCanvas(QWidget):
         remaining = sum(segment_lengths) * min(progress, 1.0)
         center_line = QPainterPath(mapped[0])
         for first, second, segment_length in zip(
-            mapped, mapped[1:], segment_lengths
+            mapped, mapped[1:], segment_lengths, strict=True
         ):
             if segment_length <= 0:
                 continue

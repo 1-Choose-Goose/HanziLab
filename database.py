@@ -66,7 +66,7 @@ class _ConnectionHolder:
     def __del__(self) -> None:
         try:
             self.close()
-        except Exception:  # noqa: BLE001, S110 - __del__ must never leak errors.
+        except Exception:  # noqa: BLE001 - __del__ must never leak errors.
             # Деструктор может вызываться на поздней стадии завершения Python.
             pass
 
@@ -184,7 +184,11 @@ def _hanzi_query(value: str) -> str:
     if not CJK_RE.search(value):
         return ""
     # В китайских заголовках встречаются латинские буквы и цифры: T恤衫, B超.
-    return "".join(char for char in value if CJK_RE.fullmatch(char) or char.isascii() and char.isalnum())
+    return "".join(
+        char
+        for char in value
+        if CJK_RE.fullmatch(char) or (char.isascii() and char.isalnum())
+    )
 
 
 def _fts_phrase(column: str, value: str) -> str:

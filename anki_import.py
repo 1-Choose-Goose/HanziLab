@@ -103,11 +103,15 @@ def parse_anki_export(path: str | Path) -> AnkiImportResult:
     seen_hanzi: set[str] = set()
     source_rows = invalid_rows = duplicate_rows = 0
 
-    for fields in reader:
-        if not fields or not any(field.strip() for field in fields):
+    for source_fields in reader:
+        if not source_fields or not any(field.strip() for field in source_fields):
             continue
         source_rows += 1
-        fields = [value for index, value in enumerate(fields) if index not in metadata_columns]
+        fields = [
+            value
+            for index, value in enumerate(source_fields)
+            if index not in metadata_columns
+        ]
         if not fields:
             invalid_rows += 1
             continue

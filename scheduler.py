@@ -189,7 +189,7 @@ def validate_config(config: SchedulerConfig) -> None:
     if len(config.fsrs_parameters) != 21:
         raise ValueError("FSRS-6 использует ровно 21 параметр")
     for index, (value, bounds) in enumerate(
-        zip(config.fsrs_parameters, FSRS6_PARAMETER_BOUNDS)
+        zip(config.fsrs_parameters, FSRS6_PARAMETER_BOUNDS, strict=True)
     ):
         if not math.isfinite(value) or not bounds[0] <= value <= bounds[1]:
             raise ValueError(
@@ -388,7 +388,7 @@ def _review_interval(
         if candidates and total_weight > 0:
             target = position * total_weight
             cumulative = 0.0
-            for candidate, weight in zip(candidates, weights):
+            for candidate, weight in zip(candidates, weights, strict=True):
                 cumulative += weight
                 if target <= cumulative:
                     days = candidate

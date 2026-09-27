@@ -70,11 +70,15 @@ class AppIconTests(unittest.TestCase):
             self.assertEqual(developer.text(), "Choose_Goose")
             links = contacts.findChildren(QLabel, "aboutContactLink")
             self.assertEqual(len(links), 3)
-            for link, contact in zip(links, (
-                "https://vk.ru/kamereka",
-                "https://t.me/choose_o_goose",
-                "https://t.me/yi_bi_yi_hua",
-            )):
+            for link, contact in zip(
+                links,
+                (
+                    "https://vk.ru/kamereka",
+                    "https://t.me/choose_o_goose",
+                    "https://t.me/yi_bi_yi_hua",
+                ),
+                strict=True,
+            ):
                 self.assertTrue(link.openExternalLinks())
                 self.assertEqual(
                     link.textInteractionFlags(),

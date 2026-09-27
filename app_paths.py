@@ -4,7 +4,6 @@ import os
 import sys
 from pathlib import Path
 
-
 APP_NAME = "HanziLab"
 SOURCE_ROOT = Path(__file__).resolve().parent
 
