@@ -158,7 +158,7 @@ class UpdateClientTests(unittest.TestCase):
             ):
                 updates.launch_updater(archive)
 
-            self.assertEqual(launch.call_args.kwargs["cwd"], updater_folder)
+            self.assertEqual(launch.call_args.kwargs["cwd"], updater_folder.parent)
 
 
 class ApplyUpdateTests(unittest.TestCase):

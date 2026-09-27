@@ -215,7 +215,7 @@ def launch_updater(archive: Path) -> None:
             ],
             close_fds=True,
             creationflags=creation_flags,
-            cwd=updater_dir,
+            cwd=updater_dir.parent,
         )
     except OSError as error:
         shutil.rmtree(updater_dir, ignore_errors=True)
