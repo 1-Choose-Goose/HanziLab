@@ -25,106 +25,79 @@ class ApplyUpdateError(RuntimeError):
 
 
 class UpdateProgressWindow:
-    """Small dependency-free Windows progress window for the standalone updater."""
+    """Updater progress dialog styled like the main HanziLab interface."""
 
     def __init__(self) -> None:
-        self.window = None
+        self.app = None
+        self.dialog = None
         self.label = None
         self.progress = None
         if os.name != "nt":
             return
-        from ctypes import wintypes
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QFont, QIcon
+        from PySide6.QtWidgets import (
+            QApplication,
+            QDialog,
+            QLabel,
+            QProgressBar,
+            QVBoxLayout,
+        )
 
-        user32 = ctypes.windll.user32
-        ctypes.windll.comctl32.InitCommonControls()
-        user32.CreateWindowExW.restype = wintypes.HWND
-        width, height = 470, 175
-        x = max(0, (user32.GetSystemMetrics(0) - width) // 2)
-        y = max(0, (user32.GetSystemMetrics(1) - height) // 2)
-        # WS_EX_TOOLWINDOW keeps the installer out of the taskbar. It is a
-        # transient status window, not a second application window.
-        self.window = user32.CreateWindowExW(
-            0x00000080 | 0x00000008,
-            "STATIC",
-            "Обновление HanziLab",
-            0x80000000 | 0x00C00000 | 0x10000000,
-            x,
-            y,
-            width,
-            height,
-            None,
-            None,
-            None,
-            None,
+        self.app = QApplication.instance() or QApplication(["HanziLabUpdater"])
+        self.app.setApplicationName("Обновление HanziLab")
+        self.app.setStyle("Fusion")
+        self.app.setFont(QFont("Times New Roman", 10))
+        self.dialog = QDialog()
+        self.dialog.setWindowTitle("Обновление HanziLab")
+        self.dialog.setWindowIcon(QIcon(sys.executable))
+        self.dialog.setWindowFlag(Qt.WindowType.Tool, True)
+        self.dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        self.dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.dialog.setFixedSize(480, 205)
+        self.dialog.setObjectName("updateDialog")
+
+        layout = QVBoxLayout(self.dialog)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(10)
+        title = QLabel("Устанавливаем обновление")
+        title.setObjectName("updateTitle")
+        self.label = QLabel("Подготовка…")
+        self.label.setObjectName("updateStatus")
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setTextVisible(True)
+        self.progress.setFixedHeight(18)
+        footer = QLabel("После установки HanziLab откроется автоматически")
+        footer.setObjectName("updateFooter")
+        layout.addWidget(title)
+        layout.addWidget(self.label)
+        layout.addWidget(self.progress)
+        layout.addWidget(footer)
+        self.dialog.setStyleSheet(
+            "QDialog#updateDialog { background: #F7F9FA; color: #182026; }"
+            "QLabel#updateTitle { color: #182026; font-size: 17px; font-weight: 700; }"
+            "QLabel#updateStatus { color: #344149; font-size: 13px; }"
+            "QLabel#updateFooter { color: #758188; font-size: 11px; }"
+            "QProgressBar { background: #E8EDEF; color: #344149; border: none; "
+            "border-radius: 6px; text-align: center; }"
+            "QProgressBar::chunk { background: #E05945; border-radius: 6px; }"
         )
-        if not self.window:
-            return
-        title = user32.CreateWindowExW(
-            0,
-            "STATIC",
-            "Устанавливаем обновление…",
-            0x50000000,
-            28,
-            24,
-            410,
-            24,
-            self.window,
-            None,
-            None,
-            None,
-        )
-        self.label = user32.CreateWindowExW(
-            0,
-            "STATIC",
-            "Закрываем программу…",
-            0x50000000,
-            28,
-            56,
-            410,
-            24,
-            self.window,
-            None,
-            None,
-            None,
-        )
-        self.progress = user32.CreateWindowExW(
-            0,
-            "msctls_progress32",
-            None,
-            0x50000001,
-            28,
-            94,
-            410,
-            20,
-            self.window,
-            None,
-            None,
-            None,
-        )
-        font = ctypes.windll.gdi32.GetStockObject(17)  # DEFAULT_GUI_FONT
-        for control in (title, self.label):
-            user32.SendMessageW(control, 0x0030, font, True)  # WM_SETFONT
-        user32.SendMessageW(self.progress, 0x0406, 0, 100)  # PBM_SETRANGE32
+        self.dialog.show()
         self.update(3, "Закрываем программу…")
 
     def update(self, value: int, text: str) -> None:
-        if not self.window:
+        if self.dialog is None:
             return
-        user32 = ctypes.windll.user32
-        user32.SetWindowTextW(self.label, text)
-        user32.SendMessageW(self.progress, 0x0402, max(0, min(100, value)), 0)
-        from ctypes import wintypes
-
-        message = wintypes.MSG()
-        while user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 1):
-            user32.TranslateMessage(ctypes.byref(message))
-            user32.DispatchMessageW(ctypes.byref(message))
-        user32.UpdateWindow(self.window)
+        self.label.setText(text)
+        self.progress.setValue(max(0, min(100, value)))
+        self.app.processEvents()
 
     def close(self) -> None:
-        if self.window:
-            ctypes.windll.user32.DestroyWindow(self.window)
-            self.window = None
+        if self.dialog is not None:
+            self.dialog.close()
+            self.app.processEvents()
+            self.dialog = None
 
 
 def wait_for_process(pid: int, timeout: float = 120.0) -> None:
@@ -196,7 +169,7 @@ def apply_update(
         not install_dir.is_dir()
         or install_dir.name.casefold() != "hanzilab"
         or not (install_dir / executable).is_file()
-        or not (install_dir / "HanziLabUpdater.exe").is_file()
+        or not (install_dir / "_internal" / "HanziLabUpdater.exe").is_file()
         or not (install_dir / "_internal").is_dir()
         or (install_dir / ".git").exists()
     ):

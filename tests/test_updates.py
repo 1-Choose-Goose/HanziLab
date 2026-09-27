@@ -139,7 +139,7 @@ class UpdateClientTests(unittest.TestCase):
             (install / "_internal").mkdir(parents=True)
             executable = install / "HanziLab.exe"
             executable.write_bytes(b"application")
-            (install / "HanziLabUpdater.exe").write_bytes(b"updater")
+            (install / "_internal" / "HanziLabUpdater.exe").write_bytes(b"updater")
             archive = root / "update.zip"
             archive.write_bytes(b"archive")
             updater_folder = root / "temporary-updater"
@@ -200,7 +200,7 @@ class ApplyUpdateTests(unittest.TestCase):
     def make_archive(path: Path) -> None:
         with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as package:
             package.writestr("HanziLab.exe", b"new executable")
-            package.writestr("HanziLabUpdater.exe", b"new updater")
+            package.writestr("_internal/HanziLabUpdater.exe", b"new updater")
             package.writestr("_internal/runtime.dll", b"new runtime")
             package.writestr("data/", b"")
 
@@ -211,7 +211,9 @@ class ApplyUpdateTests(unittest.TestCase):
             (install / "_internal").mkdir(parents=True)
             (install / "data").mkdir()
             (install / "HanziLab.exe").write_bytes(b"old executable")
-            (install / "HanziLabUpdater.exe").write_bytes(b"old updater")
+            (install / "_internal" / "HanziLabUpdater.exe").write_bytes(
+                b"old updater"
+            )
             (install / "_internal" / "runtime.dll").write_bytes(b"old runtime")
             (install / "data" / "study.db").write_bytes(b"user progress")
             (install / "dictionary-server.json").write_text(
@@ -253,7 +255,9 @@ class ApplyUpdateTests(unittest.TestCase):
             (install / "_internal").mkdir(parents=True)
             (install / "data").mkdir()
             (install / "HanziLab.exe").write_bytes(b"old executable")
-            (install / "HanziLabUpdater.exe").write_bytes(b"old updater")
+            (install / "_internal" / "HanziLabUpdater.exe").write_bytes(
+                b"old updater"
+            )
             (install / "_internal" / "runtime.dll").write_bytes(b"old runtime")
             (install / "data" / "study.db").write_bytes(b"user progress")
             archive = root / "update.zip"
@@ -278,7 +282,7 @@ class ApplyUpdateTests(unittest.TestCase):
             (install / "_internal").mkdir(parents=True)
             (install / ".git").mkdir()
             (install / "HanziLab.exe").write_bytes(b"executable")
-            (install / "HanziLabUpdater.exe").write_bytes(b"updater")
+            (install / "_internal" / "HanziLabUpdater.exe").write_bytes(b"updater")
             archive = Path(folder) / "update.zip"
             self.make_archive(archive)
 

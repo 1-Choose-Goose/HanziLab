@@ -10,6 +10,10 @@ release/
 output/
 tmp/
 dictionary-server.json
+dictionary-server-ca.pem
+scripts/deploy_dictionary.py
+scripts/upload_dictionary.py
+scripts/server_credentials.py
 .idea/
 data/hanzi.db
 data/dictionary.db

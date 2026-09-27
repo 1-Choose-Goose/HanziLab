@@ -28,6 +28,7 @@ LATEST_RELEASE_API = (
 )
 WINDOWS_ASSET_NAME = "HanziLab-Windows-x64.zip"
 UPDATER_NAME = "HanziLabUpdater.exe"
+UPDATER_RELATIVE_PATH = Path("_internal") / UPDATER_NAME
 UPDATE_LOCK_NAME = "update.lock"
 _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 _SHA256_RE = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
@@ -246,7 +247,7 @@ def launch_updater(archive: Path) -> None:
         or (install_dir / ".git").exists()
     ):
         raise UpdateError("Папка установки HanziLab не прошла проверку безопасности")
-    source_updater = install_dir / UPDATER_NAME
+    source_updater = install_dir / UPDATER_RELATIVE_PATH
     if not source_updater.is_file():
         raise UpdateError("Рядом с HanziLab.exe не найден модуль обновления")
     updater_dir = Path(tempfile.mkdtemp(prefix="HanziLab-updater-"))

@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QWidget,
 )
 
 import desktop
@@ -75,9 +76,11 @@ class AppIconTests(unittest.TestCase):
             version = window.findChild(QLabel, "aboutVersion")
             update_button = window.findChild(QPushButton, "checkUpdatesButton")
             contacts = window.findChild(QFrame, "aboutContacts")
+            content = window.findChild(QWidget, "aboutContent")
             self.assertEqual(developer.text(), "Choose_Goose")
             self.assertIn(desktop.APP_VERSION, version.text())
             self.assertEqual(update_button.text(), "Проверить обновления")
+            self.assertEqual(content.maximumWidth(), 780)
             links = contacts.findChildren(QLabel, "aboutContactLink")
             self.assertEqual(len(links), 3)
             for link, contact in zip(
@@ -122,6 +125,12 @@ class AppIconTests(unittest.TestCase):
         buttons = [button.text() for button in dialog.findChildren(QPushButton)]
         self.assertIn("Подробнее…", buttons)
         self.assertFalse(any("Details" in text for text in buttons))
+        details = next(
+            button
+            for button in dialog.findChildren(QPushButton)
+            if button.text() == "Подробнее…"
+        )
+        self.assertGreaterEqual(details.minimumWidth(), 120)
         dialog.deleteLater()
 
     def test_window_title_is_not_duplicated_by_display_name(self):

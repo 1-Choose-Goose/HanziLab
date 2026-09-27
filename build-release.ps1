@@ -14,7 +14,7 @@ if ($LASTEXITCODE -ne 0) {
 
 python -m PyInstaller --noconfirm --clean --onefile --windowed `
     --name HanziLabUpdater `
-    --icon (Join-Path $PSScriptRoot "assets\icons\hanzilab.ico") `
+    --icon (Join-Path $PSScriptRoot "assets\icons\updater.ico") `
     --distpath (Join-Path $PSScriptRoot "build\updater-dist") `
     --workpath (Join-Path $PSScriptRoot "build\updater-build") `
     --specpath (Join-Path $PSScriptRoot "build") `
@@ -26,7 +26,7 @@ $updater = Join-Path $PSScriptRoot "build\updater-dist\HanziLabUpdater.exe"
 if (-not (Test-Path -LiteralPath $updater)) {
     throw "Build completed without HanziLabUpdater.exe"
 }
-Copy-Item -LiteralPath $updater -Destination (Join-Path $distribution "HanziLabUpdater.exe") -Force
+Copy-Item -LiteralPath $updater -Destination (Join-Path $distribution "_internal\HanziLabUpdater.exe") -Force
 
 $executable = Join-Path $distribution "HanziLab.exe"
 if (-not (Test-Path -LiteralPath $executable)) {
