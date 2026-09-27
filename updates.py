@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -26,6 +28,7 @@ LATEST_RELEASE_API = (
 )
 WINDOWS_ASSET_NAME = "HanziLab-Windows-x64.zip"
 UPDATER_NAME = "HanziLabUpdater.exe"
+UPDATE_LOCK_NAME = "update.lock"
 _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 _SHA256_RE = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 
@@ -61,6 +64,56 @@ def updates_supported() -> bool:
         and bool(getattr(sys, "frozen", False))
         and os.environ.get("HANZILAB_DISABLE_UPDATES") != "1"
     )
+
+
+def update_lock_path() -> Path:
+    root = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+    return root / "HanziLab" / UPDATE_LOCK_NAME
+
+
+def _process_is_running(pid: int) -> bool:
+    if pid <= 0 or os.name != "nt":
+        return False
+    handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)
+    if not handle:
+        return False
+    try:
+        return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == 0x00000102
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def _write_update_lock(path: Path, pid: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps({"pid": pid, "created_at": time.time()}), encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def is_update_in_progress() -> bool:
+    """Return true only while the process recorded by the update lock is alive."""
+    path = update_lock_path()
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        pid = int(payload["pid"])
+        created_at = float(payload["created_at"])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        try:
+            created_at = path.stat().st_mtime
+        except OSError:
+            return False
+        pid = 0
+    age = time.time() - created_at
+    # The one-file updater needs a short moment to unpack and replace the
+    # launcher's PID with its own. Keep the hand-off locked during that gap.
+    if 0 <= age <= 30 or (age <= 30 * 60 and _process_is_running(pid)):
+        return True
+    path.unlink(missing_ok=True)
+    return False
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -199,8 +252,10 @@ def launch_updater(archive: Path) -> None:
     updater_dir = Path(tempfile.mkdtemp(prefix="HanziLab-updater-"))
     updater = updater_dir / UPDATER_NAME
     shutil.copy2(source_updater, updater)
+    lock_file = update_lock_path()
     creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     try:
+        _write_update_lock(lock_file, os.getpid())
         subprocess.Popen(
             [
                 str(updater),
@@ -212,12 +267,15 @@ def launch_updater(archive: Path) -> None:
                 str(os.getpid()),
                 "--executable",
                 Path(sys.executable).name,
+                "--lock-file",
+                str(lock_file),
             ],
             close_fds=True,
             creationflags=creation_flags,
             cwd=updater_dir.parent,
         )
     except OSError as error:
+        lock_file.unlink(missing_ok=True)
         shutil.rmtree(updater_dir, ignore_errors=True)
         raise UpdateError("Не удалось запустить модуль обновления") from error
 

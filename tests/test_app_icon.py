@@ -9,7 +9,13 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QImage
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QPushButton
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+)
 
 import desktop
 from study_database import StudyRepository
@@ -108,6 +114,15 @@ class AppIconTests(unittest.TestCase):
         )
         self.assertIn("QMessageBox QPushButton:hover", desktop.STYLESHEET)
         self.assertIn("QProgressDialog QProgressBar::chunk", desktop.STYLESHEET)
+
+    def test_release_notes_details_button_is_localized(self):
+        dialog = QMessageBox()
+        dialog.setDetailedText("Changes")
+        desktop.localize_message_box_details(dialog)
+        buttons = [button.text() for button in dialog.findChildren(QPushButton)]
+        self.assertIn("Подробнее…", buttons)
+        self.assertFalse(any("Details" in text for text in buttons))
+        dialog.deleteLater()
 
     def test_window_title_is_not_duplicated_by_display_name(self):
         source = (Path(__file__).parents[1] / "desktop.py").read_text(

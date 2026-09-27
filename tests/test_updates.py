@@ -154,11 +154,45 @@ class UpdateClientTests(unittest.TestCase):
                     "mkdtemp",
                     return_value=str(updater_folder),
                 ),
+                patch.object(
+                    updates,
+                    "update_lock_path",
+                    return_value=root / "update.lock",
+                ),
                 patch.object(updates.subprocess, "Popen") as launch,
             ):
                 updates.launch_updater(archive)
 
             self.assertEqual(launch.call_args.kwargs["cwd"], updater_folder.parent)
+            self.assertIn("--lock-file", launch.call_args.args[0])
+            self.assertTrue((root / "update.lock").is_file())
+
+    def test_active_update_lock_blocks_a_second_launch(self):
+        with tempfile.TemporaryDirectory() as folder:
+            lock = Path(folder) / "update.lock"
+            lock.write_text(
+                json.dumps({"pid": 1234, "created_at": 1}), encoding="utf-8"
+            )
+            with (
+                patch.object(updates, "update_lock_path", return_value=lock),
+                patch.object(updates.time, "time", return_value=10),
+                patch.object(updates, "_process_is_running", return_value=True),
+            ):
+                self.assertTrue(updates.is_update_in_progress())
+
+    def test_stale_update_lock_is_removed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            lock = Path(folder) / "update.lock"
+            lock.write_text(
+                json.dumps({"pid": 1234, "created_at": 1}), encoding="utf-8"
+            )
+            with (
+                patch.object(updates, "update_lock_path", return_value=lock),
+                patch.object(updates.time, "time", return_value=3600),
+                patch.object(updates, "_process_is_running", return_value=False),
+            ):
+                self.assertFalse(updates.is_update_in_progress())
+            self.assertFalse(lock.exists())
 
 
 class ApplyUpdateTests(unittest.TestCase):
@@ -255,6 +289,30 @@ class ApplyUpdateTests(unittest.TestCase):
 
             self.assertTrue((install / ".git").is_dir())
             self.assertEqual((install / "HanziLab.exe").read_bytes(), b"executable")
+
+    def test_cleanup_helper_is_hidden_and_runs_outside_updater_folder(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            updater_folder = root / "HanziLab-updater-test"
+            updater_folder.mkdir()
+            executable = updater_folder / "HanziLabUpdater.exe"
+            executable.write_bytes(b"updater")
+            with (
+                patch.object(updater.os, "name", "nt"),
+                patch.object(updater.sys, "frozen", True, create=True),
+                patch.object(updater.sys, "executable", str(executable)),
+                patch.object(updater.tempfile, "gettempdir", return_value=str(root)),
+                patch.object(updater.subprocess, "Popen") as launch,
+            ):
+                updater._schedule_self_cleanup()
+
+            flags = launch.call_args.kwargs["creationflags"]
+            self.assertTrue(flags & subprocess_create_no_window())
+            self.assertEqual(launch.call_args.kwargs["cwd"], root.resolve())
+
+
+def subprocess_create_no_window() -> int:
+    return getattr(updater.subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 
 if __name__ == "__main__":

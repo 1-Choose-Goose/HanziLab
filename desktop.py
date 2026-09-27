@@ -92,6 +92,31 @@ DEVELOPER_NAME = "Choose_Goose"
 VK_URL = "https://vk.ru/kamereka"
 TELEGRAM_URL = "https://t.me/choose_o_goose"
 TELEGRAM_CHANNEL_URL = "https://t.me/yi_bi_yi_hua"
+APP_USER_MODEL_ID = "HanziLab.Desktop"
+
+
+def localize_message_box_details(dialog: QMessageBox) -> None:
+    """Keep Qt's automatically created details button in Russian."""
+    for button in dialog.findChildren(QPushButton):
+        normalized = button.text().replace("&", "").strip().lower()
+        if "details" not in normalized and "подробн" not in normalized:
+            continue
+        hidden = "hide" in normalized or "скрыт" in normalized
+        button.setText("Скрыть подробности" if hidden else "Подробнее…")
+        if not button.property("hanzilabDetailsLocalized"):
+            button.setProperty("hanzilabDetailsLocalized", True)
+            button.clicked.connect(
+                lambda _checked=False, box=dialog: QTimer.singleShot(
+                    0, lambda: localize_message_box_details(box)
+                )
+            )
+
+
+def exec_message_box(dialog: QMessageBox) -> int:
+    """Open a styled message box after localizing Qt-owned controls."""
+    localize_message_box_details(dialog)
+    QTimer.singleShot(0, lambda: localize_message_box_details(dialog))
+    return dialog.exec()
 
 
 class BackgroundTaskSignals(QObject):
@@ -917,7 +942,7 @@ class HanziLabWindow(QMainWindow):
             dialog.setDetailedText(update.notes[:8000])
         install_button = dialog.addButton("Обновить", QMessageBox.ButtonRole.AcceptRole)
         dialog.addButton("Не сейчас", QMessageBox.ButtonRole.RejectRole)
-        dialog.exec()
+        exec_message_box(dialog)
         if dialog.clickedButton() is install_button:
             self._download_update(update)
 
@@ -959,6 +984,22 @@ class HanziLabWindow(QMainWindow):
                 QMessageBox.warning(
                     self, "Не удалось обновить HanziLab", str(error)
                 )
+            return
+        confirmation = QMessageBox(self)
+        confirmation.setIcon(QMessageBox.Icon.Information)
+        confirmation.setWindowTitle("Всё готово к обновлению")
+        confirmation.setText("HanziLab сейчас установит новую версию.")
+        confirmation.setInformativeText(
+            "Программа закроется, покажет ход установки и откроется снова."
+        )
+        install_button = confirmation.addButton(
+            "Установить", QMessageBox.ButtonRole.AcceptRole
+        )
+        confirmation.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        exec_message_box(confirmation)
+        if confirmation.clickedButton() is not install_button:
+            if download_path is not None:
+                shutil.rmtree(download_path.parent, ignore_errors=True)
             return
         try:
             updates.launch_updater(Path(result))
@@ -2275,6 +2316,13 @@ def main() -> None:
         return
     if not smoke_test and not dictionary_remote.enabled() and not DB_PATH.exists():
         raise SystemExit("В комплекте приложения не найдена база HanziLab")
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                APP_USER_MODEL_ID
+            )
+        except (AttributeError, OSError):
+            pass
     app = QApplication(sys.argv)
     app.setApplicationName("HanziLab")
     app.setOrganizationName("HanziLab")
@@ -2283,17 +2331,18 @@ def main() -> None:
     app.installEventFilter(window_centering_filter)
     if smoke_test:
         return
-    if sys.platform == "win32":
-        try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "HanziLab.Desktop"
-            )
-        except (AttributeError, OSError):
-            pass
     app.setStyle("Fusion")
     load_chinese_fonts()
     app.setFont(QFont(RUSSIAN_FONT_FAMILY, 10))
     app.setStyleSheet(STYLESHEET)
+    if updates.is_update_in_progress():
+        QMessageBox.information(
+            None,
+            "HanziLab обновляется",
+            "Уже идёт установка новой версии.\n\n"
+            "После завершения HanziLab откроется автоматически.",
+        )
+        return
     window = HanziLabWindow()
     window.show()
     window.schedule_search_warmup()
