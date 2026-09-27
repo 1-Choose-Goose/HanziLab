@@ -1299,7 +1299,7 @@ class HanziLabWindow(QMainWindow):
         layout.addWidget(title)
 
         subtitle = QLabel(
-            "Китайский язык — от первого штриха до уверенного знания."
+            "Иероглифы, пиньинь, перевод и примеры в одном месте."
         )
         subtitle.setObjectName("pageSubtitle")
         subtitle.setWordWrap(True)
