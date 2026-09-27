@@ -132,6 +132,34 @@ class UpdateClientTests(unittest.TestCase):
                 task.run()
             self.assertFalse(download_folder.exists())
 
+    def test_updater_is_launched_outside_the_installation_directory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            install = root / "HanziLab"
+            (install / "_internal").mkdir(parents=True)
+            executable = install / "HanziLab.exe"
+            executable.write_bytes(b"application")
+            (install / "HanziLabUpdater.exe").write_bytes(b"updater")
+            archive = root / "update.zip"
+            archive.write_bytes(b"archive")
+            updater_folder = root / "temporary-updater"
+            updater_folder.mkdir()
+
+            with (
+                patch.object(updates.sys, "platform", "win32"),
+                patch.object(updates.sys, "executable", str(executable)),
+                patch.object(updates.sys, "frozen", True, create=True),
+                patch.object(
+                    updates.tempfile,
+                    "mkdtemp",
+                    return_value=str(updater_folder),
+                ),
+                patch.object(updates.subprocess, "Popen") as launch,
+            ):
+                updates.launch_updater(archive)
+
+            self.assertEqual(launch.call_args.kwargs["cwd"], updater_folder)
+
 
 class ApplyUpdateTests(unittest.TestCase):
     @staticmethod
@@ -149,6 +177,7 @@ class ApplyUpdateTests(unittest.TestCase):
             (install / "_internal").mkdir(parents=True)
             (install / "data").mkdir()
             (install / "HanziLab.exe").write_bytes(b"old executable")
+            (install / "HanziLabUpdater.exe").write_bytes(b"old updater")
             (install / "_internal" / "runtime.dll").write_bytes(b"old runtime")
             (install / "data" / "study.db").write_bytes(b"user progress")
             (install / "dictionary-server.json").write_text(
@@ -190,6 +219,7 @@ class ApplyUpdateTests(unittest.TestCase):
             (install / "_internal").mkdir(parents=True)
             (install / "data").mkdir()
             (install / "HanziLab.exe").write_bytes(b"old executable")
+            (install / "HanziLabUpdater.exe").write_bytes(b"old updater")
             (install / "_internal" / "runtime.dll").write_bytes(b"old runtime")
             (install / "data" / "study.db").write_bytes(b"user progress")
             archive = root / "update.zip"
@@ -207,6 +237,24 @@ class ApplyUpdateTests(unittest.TestCase):
                 (install / "data" / "study.db").read_bytes(), b"user progress"
             )
             self.assertFalse(list(root.glob(".HanziLab-*")))
+
+    def test_refuses_to_replace_a_source_checkout(self):
+        with tempfile.TemporaryDirectory() as folder:
+            install = Path(folder) / "HanziLab"
+            (install / "_internal").mkdir(parents=True)
+            (install / ".git").mkdir()
+            (install / "HanziLab.exe").write_bytes(b"executable")
+            (install / "HanziLabUpdater.exe").write_bytes(b"updater")
+            archive = Path(folder) / "update.zip"
+            self.make_archive(archive)
+
+            with self.assertRaisesRegex(
+                updater.ApplyUpdateError, "текущая установка"
+            ):
+                updater.apply_update(archive, install, restart=False)
+
+            self.assertTrue((install / ".git").is_dir())
+            self.assertEqual((install / "HanziLab.exe").read_bytes(), b"executable")
 
 
 if __name__ == "__main__":

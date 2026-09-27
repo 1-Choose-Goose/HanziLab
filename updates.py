@@ -187,6 +187,12 @@ def launch_updater(archive: Path) -> None:
     if not updates_supported():
         raise UpdateError("Автообновление доступно только в собранной Windows-версии")
     install_dir = Path(sys.executable).resolve().parent
+    if (
+        install_dir.name.casefold() != "hanzilab"
+        or not (install_dir / "_internal").is_dir()
+        or (install_dir / ".git").exists()
+    ):
+        raise UpdateError("Папка установки HanziLab не прошла проверку безопасности")
     source_updater = install_dir / UPDATER_NAME
     if not source_updater.is_file():
         raise UpdateError("Рядом с HanziLab.exe не найден модуль обновления")
@@ -209,6 +215,7 @@ def launch_updater(archive: Path) -> None:
             ],
             close_fds=True,
             creationflags=creation_flags,
+            cwd=updater_dir,
         )
     except OSError as error:
         shutil.rmtree(updater_dir, ignore_errors=True)

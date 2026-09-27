@@ -85,7 +85,14 @@ def apply_update(
     install_dir = install_dir.resolve()
     if not archive.is_file() or not zipfile.is_zipfile(archive):
         raise ApplyUpdateError("Архив обновления повреждён")
-    if not install_dir.is_dir() or not (install_dir / executable).is_file():
+    if (
+        not install_dir.is_dir()
+        or install_dir.name.casefold() != "hanzilab"
+        or not (install_dir / executable).is_file()
+        or not (install_dir / "HanziLabUpdater.exe").is_file()
+        or not (install_dir / "_internal").is_dir()
+        or (install_dir / ".git").exists()
+    ):
         raise ApplyUpdateError("Не найдена текущая установка HanziLab")
 
     wait_for_process(parent_pid)
@@ -105,7 +112,11 @@ def apply_update(
             payload.rename(install_dir)
             _move_preserved_items(backup, install_dir)
             if restart:
-                subprocess.Popen([str(install_dir / executable)], close_fds=True)
+                subprocess.Popen(
+                    [str(install_dir / executable)],
+                    close_fds=True,
+                    cwd=install_dir,
+                )
         except Exception:
             if install_dir.exists():
                 for name in PRESERVED_ITEMS:
