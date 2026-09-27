@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import re
+import shutil
 import sys
 import unicodedata
 from functools import cache
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -48,6 +50,7 @@ from PySide6.QtWidgets import (
 
 import database
 import dictionary_remote
+import updates
 from app_paths import RESOURCE_ROOT
 from copybook_pdf import (
     CopybookError,
@@ -70,6 +73,7 @@ from text_formatting import (
     normalize_display_text,
     valid_pinyin_syllables,
 )
+from version import APP_VERSION
 
 APP_TITLE = "HanziLab — китайско-русский словарь"
 FONT_DIR = RESOURCE_ROOT / "assets" / "fonts"
@@ -194,6 +198,68 @@ class DictionaryDownloadTask(QRunnable):
         except Exception as exception:  # noqa: BLE001 - boundary of worker task.
             result = None
             error = exception
+        self.signals.finished.emit(result, error)
+
+
+class UpdateTaskSignals(QObject):
+    progress = Signal(int)
+    finished = Signal(object, object)
+
+
+class UpdateCheckTask(QRunnable):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.cancelled = False
+        self.signals = UpdateTaskSignals()
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = updates.check_for_update()
+            error = None
+        except Exception as exception:  # noqa: BLE001 - worker boundary
+            result = None
+            error = exception
+        if not self.cancelled:
+            self.signals.finished.emit(result, error)
+
+
+class UpdateDownloadTask(QRunnable):
+    def __init__(self, update: updates.UpdateInfo, destination: Path) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.update = update
+        self.destination = destination
+        self.cancelled = False
+        self.signals = UpdateTaskSignals()
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = updates.download_update(
+                self.update,
+                self.destination,
+                progress=lambda downloaded, total: self.signals.progress.emit(
+                    min(100, round(downloaded * 100 / total))
+                ),
+                cancelled=lambda: self.cancelled,
+            )
+            error = None
+        except Exception as exception:  # noqa: BLE001 - worker boundary
+            result = None
+            error = exception
+            shutil.rmtree(self.destination.parent, ignore_errors=True)
+        if self.cancelled and result is not None:
+            shutil.rmtree(self.destination.parent, ignore_errors=True)
+            result = None
+            error = updates.UpdateError("Загрузка обновления отменена")
         self.signals.finished.emit(result, error)
 
 
@@ -708,6 +774,12 @@ class HanziLabWindow(QMainWindow):
         self.background_pool = QThreadPool(self)
         self.background_pool.setMaxThreadCount(2)
         self.background_tasks: set[BackgroundTask] = set()
+        self.update_pool = QThreadPool(self)
+        self.update_pool.setMaxThreadCount(1)
+        self.update_tasks: set[UpdateCheckTask | UpdateDownloadTask] = set()
+        self.update_check_active = False
+        self.update_progress: QProgressDialog | None = None
+        self.update_download_path: Path | None = None
         self.study_repository = study_repository or StudyRepository()
         self.settings = QSettings("HanziLab", "HanziLab")
         saved_source = self.settings.value("dictionary_source", "server", type=str)
@@ -763,6 +835,10 @@ class HanziLabWindow(QMainWindow):
         self.search_warmup_timer.setSingleShot(True)
         self.search_warmup_timer.setInterval(700)
         self.search_warmup_timer.timeout.connect(self.start_search_warmup)
+        self.update_timer = QTimer(self)
+        self.update_timer.setSingleShot(True)
+        self.update_timer.setInterval(2500)
+        self.update_timer.timeout.connect(self.check_for_updates)
         self.search_input.textChanged.connect(self.on_search_text_changed)
         self.search_input.returnPressed.connect(self.run_search)
         self.show_empty_state()
@@ -772,6 +848,128 @@ class HanziLabWindow(QMainWindow):
         """Прогреть FTS после показа окна, не задерживая запуск интерфейса."""
         if not self.closing and not self.search_warmup_started:
             self.search_warmup_timer.start()
+
+    def schedule_update_check(self) -> None:
+        if updates.updates_supported() and not self.closing:
+            self.update_timer.start()
+
+    def _start_update_task(
+        self, task: UpdateCheckTask | UpdateDownloadTask
+    ) -> None:
+        self.update_tasks.add(task)
+        task.signals.finished.connect(
+            lambda *_arguments, worker=task: self.update_tasks.discard(worker)
+        )
+        self.update_pool.start(task)
+
+    def check_for_updates(self, *, manual: bool = False) -> None:
+        self.update_timer.stop()
+        if self.closing or self.update_check_active:
+            return
+        if not updates.updates_supported():
+            if manual:
+                QMessageBox.information(
+                    self,
+                    "Обновления HanziLab",
+                    "Автообновление доступно в собранной Windows-версии.",
+                )
+            return
+        self.update_check_active = True
+        self.check_updates_button.setEnabled(False)
+        self.check_updates_button.setText("Проверяю…")
+        task = UpdateCheckTask()
+        task.signals.finished.connect(
+            lambda result, error, requested=manual: self._update_check_finished(
+                result, error, requested
+            )
+        )
+        self._start_update_task(task)
+
+    def _update_check_finished(
+        self, result: object, error: object, manual: bool
+    ) -> None:
+        self.update_check_active = False
+        if self.closing:
+            return
+        self.check_updates_button.setEnabled(True)
+        self.check_updates_button.setText("Проверить обновления")
+        if error is not None:
+            if manual:
+                QMessageBox.warning(
+                    self, "Не удалось проверить обновления", str(error)
+                )
+            return
+        if result is None:
+            if manual:
+                QMessageBox.information(
+                    self,
+                    "Обновления HanziLab",
+                    f"У вас уже установлена актуальная версия {APP_VERSION}.",
+                )
+            return
+        update = result
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setWindowTitle("Доступно обновление")
+        dialog.setText(f"Вышла новая версия HanziLab {update.version}.")
+        dialog.setInformativeText("Желаете обновить программу сейчас?")
+        if update.notes:
+            dialog.setDetailedText(update.notes[:8000])
+        install_button = dialog.addButton("Обновить", QMessageBox.ButtonRole.AcceptRole)
+        dialog.addButton("Не сейчас", QMessageBox.ButtonRole.RejectRole)
+        dialog.exec()
+        if dialog.clickedButton() is install_button:
+            self._download_update(update)
+
+    def _download_update(self, update: updates.UpdateInfo) -> None:
+        destination = updates.create_download_path(update.version)
+        self.update_download_path = destination
+        progress = QProgressDialog(
+            f"Загрузка HanziLab {update.version}…", "Отмена", 0, 100, self
+        )
+        progress.setWindowTitle("Обновление HanziLab")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        self.update_progress = progress
+        task = UpdateDownloadTask(update, destination)
+        task.signals.progress.connect(progress.setValue)
+        progress.canceled.connect(task.cancel)
+        task.signals.finished.connect(self._update_download_finished)
+        self._start_update_task(task)
+        progress.show()
+
+    def _update_download_finished(self, result: object, error: object) -> None:
+        download_path = self.update_download_path
+        self.update_download_path = None
+        progress = self.update_progress
+        self.update_progress = None
+        if progress is not None:
+            progress.close()
+            progress.deleteLater()
+        if self.closing:
+            if download_path is not None:
+                shutil.rmtree(download_path.parent, ignore_errors=True)
+            return
+        if error is not None:
+            if download_path is not None:
+                shutil.rmtree(download_path.parent, ignore_errors=True)
+            if "отменена" not in str(error).lower():
+                QMessageBox.warning(
+                    self, "Не удалось обновить HanziLab", str(error)
+                )
+            return
+        try:
+            updates.launch_updater(Path(result))
+        except (OSError, updates.UpdateError) as exception:
+            if download_path is not None:
+                shutil.rmtree(download_path.parent, ignore_errors=True)
+            QMessageBox.warning(
+                self, "Не удалось запустить обновление", str(exception)
+            )
+            return
+        QApplication.quit()
 
     def start_search_warmup(self) -> None:
         if (
@@ -1107,6 +1305,20 @@ class HanziLabWindow(QMainWindow):
         description.setObjectName("aboutDescription")
         description.setWordWrap(True)
         card_layout.addWidget(description)
+
+        version_row = QHBoxLayout()
+        version_label = QLabel(f"Версия {APP_VERSION}")
+        version_label.setObjectName("aboutVersion")
+        version_row.addWidget(version_label)
+        version_row.addStretch()
+        self.check_updates_button = QPushButton("Проверить обновления")
+        self.check_updates_button.setObjectName("checkUpdatesButton")
+        self.check_updates_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.check_updates_button.clicked.connect(
+            lambda: self.check_for_updates(manual=True)
+        )
+        version_row.addWidget(self.check_updates_button)
+        card_layout.addLayout(version_row)
 
         contact_title = QLabel("КОНТАКТЫ И ОБНОВЛЕНИЯ")
         contact_title.setObjectName("aboutContactTitle")
@@ -1724,6 +1936,10 @@ class HanziLabWindow(QMainWindow):
         self.current_result = None
         self.search_timer.stop()
         self.search_warmup_timer.stop()
+        self.update_timer.stop()
+        for task in tuple(self.update_tasks):
+            task.cancel()
+        self.update_pool.clear()
         self.study_page.shutdown()
         self.cancel_background_tasks()
         self.background_pool.clear()
@@ -1763,6 +1979,10 @@ QLabel#aboutRole, QLabel#aboutContactTitle { color: #829198; font-size: 10px; fo
 QLabel#aboutDeveloper { color: #1D2B31; font-size: 18px; font-weight: 700; }
 QFrame#aboutDivider { color: #E8ECEE; background: #E8ECEE; border: none; max-height: 1px; }
 QLabel#aboutDescription { color: #536269; font-size: 14px; line-height: 1.55; }
+QLabel#aboutVersion { color: #66767D; font-size: 12px; font-weight: 600; }
+QPushButton#checkUpdatesButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 9px 13px; font-size: 12px; font-weight: 600; }
+QPushButton#checkUpdatesButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
+QPushButton#checkUpdatesButton:disabled { background: #F2F4F5; color: #A8B1B5; }
 QFrame#aboutContacts { background: #F7F9F9; border: 1px solid #E5EAEC; border-radius: 10px; }
 QLabel#aboutContactLink { background: transparent; border: none; font-size: 14px; }
 QLabel#aboutFooter { color: #91A0A6; font-size: 11px; letter-spacing: 0.7px; padding: 10px 2px; }
@@ -2069,6 +2289,7 @@ def main() -> None:
     window = HanziLabWindow()
     window.show()
     window.schedule_search_warmup()
+    window.schedule_update_check()
     raise SystemExit(app.exec())
 
 

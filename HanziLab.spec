@@ -1,24 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from pathlib import Path
+import re
 import sys
+from pathlib import Path
 
 
 PROJECT_ROOT = Path(SPECPATH)
+VERSION_SOURCE = (PROJECT_ROOT / "version.py").read_text(encoding="utf-8")
+APP_VERSION = re.search(r'APP_VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"', VERSION_SOURCE).group(1)
+DATA_FILES = [
+    (str(PROJECT_ROOT / "assets" / "fonts"), "assets/fonts"),
+    (str(PROJECT_ROOT / "assets" / "icons"), "assets/icons"),
+    (str(PROJECT_ROOT / "assets" / "strokes"), "assets/strokes"),
+    (str(PROJECT_ROOT / "assets" / "cursive"), "assets/cursive"),
+    (str(PROJECT_ROOT / "data" / "hanzi-placeholder.db"), "data"),
+]
+for optional_file in ("dictionary-server.json", "dictionary-server-ca.pem"):
+    path = PROJECT_ROOT / optional_file
+    if path.is_file():
+        DATA_FILES.append((str(path), "."))
 
 a = Analysis(
     [str(PROJECT_ROOT / "desktop.py")],
     pathex=[str(PROJECT_ROOT)],
     binaries=[],
-    datas=[
-        (str(PROJECT_ROOT / "assets" / "fonts"), "assets/fonts"),
-        (str(PROJECT_ROOT / "assets" / "icons"), "assets/icons"),
-        (str(PROJECT_ROOT / "assets" / "strokes"), "assets/strokes"),
-        (str(PROJECT_ROOT / "assets" / "cursive"), "assets/cursive"),
-        (str(PROJECT_ROOT / "data" / "hanzi-placeholder.db"), "data"),
-        (str(PROJECT_ROOT / "dictionary-server.json"), "."),
-        (str(PROJECT_ROOT / "dictionary-server-ca.pem"), "."),
-    ],
+    datas=DATA_FILES,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -90,8 +96,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleDisplayName": "HanziLab",
             "CFBundleName": "HanziLab",
-            "CFBundleShortVersionString": "1.0.0",
-            "CFBundleVersion": "1",
+            "CFBundleShortVersionString": APP_VERSION,
+            "CFBundleVersion": APP_VERSION,
             "LSMinimumSystemVersion": "12.0",
             "NSHighResolutionCapable": True,
         },

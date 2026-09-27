@@ -9,7 +9,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QImage
-from PySide6.QtWidgets import QApplication, QFrame, QLabel
+from PySide6.QtWidgets import QApplication, QFrame, QLabel, QPushButton
 
 import desktop
 from study_database import StudyRepository
@@ -66,8 +66,12 @@ class AppIconTests(unittest.TestCase):
 
             self.assertEqual(window.page_stack.currentIndex(), 3)
             developer = window.findChild(QLabel, "aboutDeveloper")
+            version = window.findChild(QLabel, "aboutVersion")
+            update_button = window.findChild(QPushButton, "checkUpdatesButton")
             contacts = window.findChild(QFrame, "aboutContacts")
             self.assertEqual(developer.text(), "Choose_Goose")
+            self.assertIn(desktop.APP_VERSION, version.text())
+            self.assertEqual(update_button.text(), "Проверить обновления")
             links = contacts.findChildren(QLabel, "aboutContactLink")
             self.assertEqual(len(links), 3)
             for link, contact in zip(

@@ -1,0 +1,71 @@
+name: Release Windows
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Restore private server configuration
+        if: ${{ secrets.DICTIONARY_SERVER_JSON_B64 != '' }}
+        shell: pwsh
+        env:
+          SERVER_CONFIG: ${{ secrets.DICTIONARY_SERVER_JSON_B64 }}
+        run: '[IO.File]::WriteAllBytes("dictionary-server.json", [Convert]::FromBase64String($env:SERVER_CONFIG))'
+
+      - name: Verify tag matches application version
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          $version = python -c "from version import APP_VERSION; print(APP_VERSION)"
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match version.py ($version)"
+          }
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $env:HANZILAB_DICTIONARY_LOCAL = "1"
+          python -m unittest discover -s tests -v
+
+      - name: Build Windows application
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\build-release.ps1
+
+      - name: Package update
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Compress-Archive -Path dist\HanziLab\* -DestinationPath release\HanziLab-Windows-x64.zip -CompressionLevel Optimal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HanziLab-Windows-x64
+          path: release/HanziLab-Windows-x64.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" release\HanziLab-Windows-x64.zip --verify-tag --generate-notes --title "HanziLab ${{ github.ref_name }}"
+
