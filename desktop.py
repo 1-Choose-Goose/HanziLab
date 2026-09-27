@@ -84,6 +84,7 @@ APP_ICON_PNG = ICON_DIR / (
 APP_ICON_ICO = ICON_DIR / "hanzilab.ico"
 SPINBOX_PLUS_ICON = ICON_DIR / "spinbox-plus.svg"
 SPINBOX_MINUS_ICON = ICON_DIR / "spinbox-minus.svg"
+SIDEBAR_DROPDOWN_ICON = ICON_DIR / "dropdown-triangle-light.svg"
 KAITI_FAMILY = "KaiTi"
 XINGSHU_FAMILY = "QXyingbixing"
 INPUT_KAITI_FAMILY = "HanziLab KaiTi CJK"
@@ -2322,6 +2323,25 @@ QDialog#spacedRepetitionSettingsDialog QDoubleSpinBox::down-arrow {{
     image: url("{SPINBOX_MINUS_ICON.as_posix()}");
     width: 10px;
     height: 10px;
+}}
+QComboBox#fontSelector::drop-down,
+QComboBox#dictionarySource::drop-down {{
+    background: #203138;
+    border: none;
+    border-left: 1px solid #354A52;
+    border-top-right-radius: 8px;
+    border-bottom-right-radius: 8px;
+    width: 30px;
+}}
+QComboBox#fontSelector::drop-down:hover,
+QComboBox#dictionarySource::drop-down:hover {{
+    background: #2A4048;
+}}
+QComboBox#fontSelector::down-arrow,
+QComboBox#dictionarySource::down-arrow {{
+    image: url("{SIDEBAR_DROPDOWN_ICON.as_posix()}");
+    width: 10px;
+    height: 6px;
 }}
 """
 
