@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
-    QWidget,
 )
 
 import desktop
@@ -76,11 +75,9 @@ class AppIconTests(unittest.TestCase):
             version = window.findChild(QLabel, "aboutVersion")
             update_button = window.findChild(QPushButton, "checkUpdatesButton")
             contacts = window.findChild(QFrame, "aboutContacts")
-            content = window.findChild(QWidget, "aboutContent")
             self.assertEqual(developer.text(), "Choose_Goose")
             self.assertIn(desktop.APP_VERSION, version.text())
             self.assertEqual(update_button.text(), "Проверить обновления")
-            self.assertEqual(content.maximumWidth(), 780)
             links = contacts.findChildren(QLabel, "aboutContactLink")
             self.assertEqual(len(links), 3)
             for link, contact in zip(
@@ -93,6 +90,7 @@ class AppIconTests(unittest.TestCase):
                 strict=True,
             ):
                 self.assertTrue(link.openExternalLinks())
+                self.assertEqual(link.alignment(), Qt.AlignmentFlag.AlignCenter)
                 self.assertEqual(
                     link.textInteractionFlags(),
                     Qt.TextInteractionFlag.TextBrowserInteraction,

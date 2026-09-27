@@ -42,7 +42,6 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QVBoxLayout,
@@ -1290,19 +1289,10 @@ class HanziLabWindow(QMainWindow):
     def create_about_page(self) -> QWidget:
         page = QWidget()
         page.setObjectName("aboutPage")
-        outer_layout = QVBoxLayout(page)
-        outer_layout.setContentsMargins(24, 20, 24, 18)
-        outer_layout.setSpacing(0)
-
-        content = QWidget()
-        content.setObjectName("aboutContent")
-        content.setMaximumWidth(780)
-        content.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
-        )
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(32, 28, 32, 24)
+        layout.setSpacing(12)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
         title = QLabel("О HanziLab")
         title.setObjectName("pageTitle")
@@ -1314,22 +1304,22 @@ class HanziLabWindow(QMainWindow):
         subtitle.setObjectName("pageSubtitle")
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
-        layout.addSpacing(8)
+        layout.addSpacing(12)
 
         card = QFrame()
         card.setObjectName("aboutCard")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(22, 20, 22, 20)
-        card_layout.setSpacing(14)
+        card_layout.setContentsMargins(24, 24, 24, 24)
+        card_layout.setSpacing(20)
         card_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
         identity = QHBoxLayout()
-        identity.setSpacing(14)
+        identity.setSpacing(18)
         mark = QLabel("汉")
         mark.setObjectName("aboutMark")
         mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        mark.setFixedSize(52, 52)
-        mark.setFont(QFont(XINGSHU_FAMILY, 27))
+        mark.setFixedSize(58, 58)
+        mark.setFont(QFont(XINGSHU_FAMILY, 30))
         identity.addWidget(mark)
 
         identity_text = QVBoxLayout()
@@ -1372,7 +1362,7 @@ class HanziLabWindow(QMainWindow):
         version_row.addWidget(self.check_updates_button)
         card_layout.addLayout(version_row)
 
-        contact_title = QLabel("КОНТАКТЫ И ОБНОВЛЕНИЯ")
+        contact_title = QLabel("КОНТАКТЫ")
         contact_title.setObjectName("aboutContactTitle")
         contact_title.setWordWrap(True)
         card_layout.addWidget(contact_title)
@@ -1380,8 +1370,8 @@ class HanziLabWindow(QMainWindow):
         contacts = QFrame()
         contacts.setObjectName("aboutContacts")
         contacts_layout = QVBoxLayout(contacts)
-        contacts_layout.setContentsMargins(16, 12, 16, 12)
-        contacts_layout.setSpacing(9)
+        contacts_layout.setContentsMargins(18, 16, 18, 16)
+        contacts_layout.setSpacing(14)
         for url, text in (
             (VK_URL, "VK · профиль разработчика ↗"),
             (TELEGRAM_URL, "Telegram · @choose_o_goose ↗"),
@@ -1395,6 +1385,7 @@ class HanziLabWindow(QMainWindow):
             link.setTextFormat(Qt.TextFormat.RichText)
             link.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
             link.setOpenExternalLinks(True)
+            link.setAlignment(Qt.AlignmentFlag.AlignCenter)
             contacts_layout.addWidget(link)
         card_layout.addWidget(contacts)
 
@@ -1404,14 +1395,7 @@ class HanziLabWindow(QMainWindow):
         footer.setObjectName("aboutFooter")
         footer.setWordWrap(True)
         layout.addWidget(footer)
-        centered_content = QHBoxLayout()
-        centered_content.setContentsMargins(0, 0, 0, 0)
-        centered_content.setSpacing(0)
-        centered_content.addStretch(1)
-        centered_content.addWidget(content, 60)
-        centered_content.addStretch(1)
-        outer_layout.addLayout(centered_content)
-        outer_layout.addStretch()
+        layout.addStretch()
         scroll = QScrollArea()
         scroll.setObjectName("aboutScroll")
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -2040,20 +2024,19 @@ QPushButton#navButton { background: transparent; color: #B3C0C5; }
 QPushButton#navButton:hover { background: #1A2A30; color: #FFFFFF; }
 QPushButton#navDisabled { background: transparent; color: #71838B; }
 QWidget#aboutPage { background: #F4F6F8; }
-QWidget#aboutContent { background: transparent; }
 QFrame#aboutCard { background: #FFFFFF; border: 1px solid #DDE4E6; border-radius: 16px; }
 QLabel#aboutMark { background: #E05945; color: #FFFFFF; border-radius: 14px; }
 QLabel#aboutRole, QLabel#aboutContactTitle { color: #829198; font-size: 10px; font-weight: 700; letter-spacing: 1.5px; }
 QLabel#aboutDeveloper { color: #1D2B31; font-size: 18px; font-weight: 700; }
 QFrame#aboutDivider { color: #E8ECEE; background: #E8ECEE; border: none; max-height: 1px; }
-QLabel#aboutDescription { color: #536269; font-size: 13px; line-height: 1.45; }
+QLabel#aboutDescription { color: #536269; font-size: 14px; line-height: 1.55; }
 QLabel#aboutVersion { color: #66767D; font-size: 12px; font-weight: 600; }
 QPushButton#checkUpdatesButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 9px 13px; font-size: 12px; font-weight: 600; }
 QPushButton#checkUpdatesButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
 QPushButton#checkUpdatesButton:disabled { background: #F2F4F5; color: #A8B1B5; }
 QFrame#aboutContacts { background: #F7F9F9; border: 1px solid #E5EAEC; border-radius: 10px; }
-QLabel#aboutContactLink { background: transparent; border: none; font-size: 13px; }
-QLabel#aboutFooter { color: #91A0A6; font-size: 11px; letter-spacing: 0.7px; padding: 6px 2px 0; }
+QLabel#aboutContactLink { background: transparent; border: none; font-size: 14px; }
+QLabel#aboutFooter { color: #91A0A6; font-size: 11px; letter-spacing: 0.7px; padding: 10px 2px; }
 QFrame#localStatus { background: #17262C; border-radius: 10px; }
 QLabel#dictionaryStatusTitle { color: #83949B; font-size: 12px; background: transparent; }
 QLabel#dictionaryStatusDetails { color: #B3C1C7; font-size: 13px; background: transparent; }
