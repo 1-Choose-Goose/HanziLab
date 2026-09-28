@@ -212,6 +212,19 @@ class RepositoryIntegrationTests(unittest.TestCase):
         self.assertTrue(self.repository.remove_card(raw_word))
         self.assertEqual(self.repository.get_card_count(), 0)
 
+    def test_selected_and_all_cards_can_be_removed_in_one_transaction(self):
+        for hanzi in ("一", "二", "三"):
+            self.assertTrue(self.repository.add_card(hanzi, "pinyin", "перевод"))
+        cards = self.repository.get_cards()
+
+        self.assertEqual(
+            self.repository.remove_cards((cards[0].id, cards[2].id, cards[0].id)),
+            2,
+        )
+        self.assertEqual([item.hanzi for item in self.repository.get_cards()], ["二"])
+        self.assertEqual(self.repository.remove_all_cards(), 1)
+        self.assertEqual(self.repository.get_card_count(), 0)
+
     def test_bulk_add_is_atomic_and_does_not_overwrite_existing_card(self):
         self.repository.add_card("学校", "xué xiào", "наш перевод")
         added = self.repository.add_cards(

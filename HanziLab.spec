@@ -2,6 +2,7 @@
 
 import re
 import sys
+import zipfile
 from pathlib import Path
 
 
@@ -11,10 +12,18 @@ APP_VERSION = re.search(r'APP_VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"', VERSION
 DATA_FILES = [
     (str(PROJECT_ROOT / "assets" / "fonts"), "assets/fonts"),
     (str(PROJECT_ROOT / "assets" / "icons"), "assets/icons"),
-    (str(PROJECT_ROOT / "assets" / "strokes"), "assets/strokes"),
-    (str(PROJECT_ROOT / "assets" / "cursive"), "assets/cursive"),
     (str(PROJECT_ROOT / "data" / "hanzi-placeholder.db"), "data"),
 ]
+PACKED_ASSET_ROOT = PROJECT_ROOT / "build" / "packed-assets"
+PACKED_ASSET_ROOT.mkdir(parents=True, exist_ok=True)
+for asset_name in ("strokes", "cursive"):
+    source = PROJECT_ROOT / "assets" / asset_name
+    archive = PACKED_ASSET_ROOT / f"{asset_name}.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as package:
+        for path in sorted(source.rglob("*")):
+            if path.is_file():
+                package.write(path, path.relative_to(source).as_posix())
+    DATA_FILES.append((str(archive), "assets"))
 for optional_file in ("dictionary-server.json", "dictionary-server-ca.pem"):
     path = PROJECT_ROOT / optional_file
     if path.is_file():

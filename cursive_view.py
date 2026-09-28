@@ -233,7 +233,8 @@ class CursivePage(QWidget):
         self.heading.setFont(QFont("KaiTi", 30))
         self.heading.setText(self.sample.character)
         self.variant.setEnabled(len(self.variants) > 1)
-        pixmap = QPixmap(str(self.sample.image_path))
+        pixmap = QPixmap()
+        pixmap.loadFromData(self.sample.image_data)
         self.preview.setPixmap(
             pixmap.scaled(
                 QSize(190, 190),

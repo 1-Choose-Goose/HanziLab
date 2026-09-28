@@ -84,7 +84,7 @@ def paint_copybook(painter: QPainter, sample: CursiveSample, image: QImage) -> N
 
 
 def generate_cursive_copybook(sample: CursiveSample, output: Path) -> Path:
-    image = QImage(str(sample.image_path))
+    image = QImage.fromData(sample.image_data)
     if image.isNull():
         raise ValueError("Не удалось загрузить образец написания.")
     output = Path(output)

@@ -11,9 +11,15 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QItemSelectionModel, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QScrollArea, QSpinBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QMessageBox,
+    QScrollArea,
+    QSpinBox,
+)
 
 import desktop
 import study_view
@@ -67,6 +73,53 @@ class StudyUiTests(unittest.TestCase):
             self.assertEqual(dialog.table.item(0, 3).text(), "Обычная")
             dialog.close()
             page.shutdown()
+
+    def test_card_list_deletes_selected_cards_or_all_cards(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repository = StudyRepository(Path(folder) / "study.db")
+            for hanzi in ("一", "二", "三"):
+                repository.add_card(hanzi, "pinyin", "перевод")
+            dialog = study_view.CardListDialog(
+                repository,
+                "HanziLab KaiTi CJK",
+                "Times New Roman",
+            )
+            deleted = []
+            dialog.cards_deleted.connect(deleted.append)
+            selection = dialog.table.selectionModel()
+            flags = (
+                QItemSelectionModel.SelectionFlag.Select
+                | QItemSelectionModel.SelectionFlag.Rows
+            )
+            selection.select(dialog.table.model().index(0, 0), flags)
+            selection.select(dialog.table.model().index(1, 0), flags)
+            self.app.processEvents()
+
+            self.assertTrue(dialog.delete_selected_button.isEnabled())
+            self.assertIn("2", dialog.delete_selected_button.text())
+            with patch.object(
+                study_view.QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ):
+                dialog.delete_selected_cards()
+
+            self.assertEqual(repository.get_card_count(), 1)
+            self.assertEqual(dialog.table.rowCount(), 1)
+            self.assertIn("1", dialog.count_label.text())
+            self.assertEqual(set(deleted[0]), {"一", "二"})
+            with patch.object(
+                study_view.QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ):
+                dialog.delete_all_cards()
+
+            self.assertEqual(repository.get_card_count(), 0)
+            self.assertEqual(dialog.table.rowCount(), 0)
+            self.assertFalse(dialog.delete_all_button.isEnabled())
+            self.assertEqual(deleted[1], ("三",))
+            dialog.close()
 
     def test_export_anki_button_writes_all_cards(self):
         with tempfile.TemporaryDirectory() as folder:

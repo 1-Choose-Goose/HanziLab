@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from functools import cache, lru_cache
 from pathlib import Path
 
+from asset_store import read_asset_bytes, read_asset_text
 from text_formatting import is_cjk
 
 ASSET_DIR = Path(__file__).resolve().parent / "assets" / "cursive"
@@ -42,26 +43,40 @@ class CursiveSample:
     def image_path(self) -> Path:
         return ASSET_DIR / self.image
 
+    @property
+    def image_data(self) -> bytes:
+        return read_asset_bytes(ASSET_DIR, self.image)
+
 
 @cache
 def load_catalog() -> tuple[CursiveSample, ...]:
-    data = json.loads((ASSET_DIR / "catalog.json").read_text(encoding="utf-8"))
+    data = json.loads(read_asset_text(ASSET_DIR, "catalog.json"))
     return tuple(CursiveSample(**sample) for sample in data["samples"])
 
 
 @cache
 def stroke_count(character: str) -> int:
     """Return the number of strokes, placing unknown characters last."""
+    indexed = load_stroke_counts().get(character)
+    if indexed is not None:
+        return indexed
     try:
-        data = json.loads(
-            (STROKE_DATA_DIR / f"{character}.json").read_text(encoding="utf-8")
-        )
+        data = json.loads(read_asset_text(STROKE_DATA_DIR, f"{character}.json"))
         strokes = data.get("strokes")
         if isinstance(strokes, list) and strokes:
             return len(strokes)
     except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
         pass
     return STROKE_COUNT_FALLBACKS.get(character, 10_000)
+
+
+@cache
+def load_stroke_counts() -> dict[str, int]:
+    try:
+        payload = json.loads(read_asset_text(ASSET_DIR, "stroke-counts.json"))
+        return {str(character): int(count) for character, count in payload.items()}
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
 
 
 @lru_cache(maxsize=64)
@@ -83,9 +98,7 @@ def group_samples(
 
 @cache
 def load_decompositions() -> dict[str, str]:
-    return json.loads(
-        (ASSET_DIR / "decomposition" / "ids.json").read_text(encoding="utf-8")
-    )
+    return json.loads(read_asset_text(ASSET_DIR, "decomposition/ids.json"))
 
 
 @dataclass(frozen=True)

@@ -117,17 +117,98 @@ def wait_for_process(pid: int, timeout: float = 120.0) -> None:
         ctypes.windll.kernel32.CloseHandle(handle)
 
 
-def _safe_extract(archive: Path, destination: Path) -> None:
+def _safe_extract(
+    archive: Path,
+    destination: Path,
+    progress: ProgressCallback | None = None,
+) -> None:
     destination_root = destination.resolve()
     with zipfile.ZipFile(archive) as package:
-        for item in package.infolist():
+        members = package.infolist()
+        for item in members:
             mode = item.external_attr >> 16
             if mode & 0o170000 == 0o120000:
                 raise ApplyUpdateError("Архив обновления содержит символическую ссылку")
             target = (destination / item.filename).resolve()
             if target != destination_root and destination_root not in target.parents:
                 raise ApplyUpdateError("Архив обновления содержит опасный путь")
-        package.extractall(destination)
+
+        total_size = max(1, sum(item.file_size for item in members))
+        extracted = 0
+        last_value = -1
+        for item in members:
+            target = destination / item.filename
+            if item.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with package.open(item) as source, target.open("wb") as output:
+                while chunk := source.read(1024 * 1024):
+                    output.write(chunk)
+                    extracted += len(chunk)
+                    value = 20 + min(35, int(extracted * 35 / total_size))
+                    if progress is not None and value != last_value:
+                        progress(value, "Распаковываем новую версию…")
+                        last_value = value
+
+
+def _set_windows_background_mode(enabled: bool) -> bool:
+    """Lower updater CPU and disk priority while it unpacks the release."""
+    if os.name != "nt":
+        return False
+    kernel32 = ctypes.windll.kernel32
+    if enabled:
+        process_changed = bool(
+            kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00004000)
+        )
+        thread_changed = bool(
+            kernel32.SetThreadPriority(kernel32.GetCurrentThread(), 0x00010000)
+        )
+        return process_changed or thread_changed
+    kernel32.SetThreadPriority(kernel32.GetCurrentThread(), 0x00020000)
+    return True
+
+
+def _desktop_directory() -> Path:
+    buffer = ctypes.create_unicode_buffer(32768)
+    result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x10, None, 0, buffer)
+    if result != 0 or not buffer.value:
+        raise OSError("Не удалось найти рабочий стол")
+    return Path(buffer.value)
+
+
+def ensure_desktop_shortcut(install_dir: Path, executable: str) -> Path:
+    """Create or refresh the HanziLab desktop shortcut without a console."""
+    shortcut = _desktop_directory() / "HanziLab.lnk"
+    target = install_dir / executable
+
+    def quote(value: Path) -> str:
+        return str(value).replace('"', '""')
+
+    descriptor, script_name = tempfile.mkstemp(
+        prefix="HanziLab-shortcut-", suffix=".vbs"
+    )
+    script = Path(script_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8-sig", newline="\r\n") as output:
+            output.write(
+                'Set shell = CreateObject("WScript.Shell")\n'
+                f'Set link = shell.CreateShortcut("{quote(shortcut)}")\n'
+                f'link.TargetPath = "{quote(target)}"\n'
+                f'link.WorkingDirectory = "{quote(install_dir)}"\n'
+                f'link.IconLocation = "{quote(target)},0"\n'
+                'link.Description = "HanziLab"\n'
+                "link.Save\n"
+            )
+        subprocess.run(
+            ["wscript.exe", "//B", "//NoLogo", str(script)],
+            check=True,
+            close_fds=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    finally:
+        script.unlink(missing_ok=True)
+    return shortcut
 
 
 def _payload_root(staging: Path, executable: str) -> Path:
@@ -185,7 +266,7 @@ def apply_update(
     try:
         staging.mkdir()
         report(20, "Распаковываем новую версию…")
-        _safe_extract(archive, staging)
+        _safe_extract(archive, staging, progress=report)
         payload = _payload_root(staging, executable)
         if not (payload / "_internal").is_dir():
             raise ApplyUpdateError("В архиве нет зависимостей HanziLab")
@@ -303,10 +384,12 @@ def main() -> int:
     parser.add_argument("--no-restart", action="store_true", help=argparse.SUPPRESS)
     arguments: argparse.Namespace | None = None
     progress_window: UpdateProgressWindow | None = None
+    background_mode = False
     try:
         arguments = parser.parse_args()
         _claim_update_lock(arguments.lock_file)
         progress_window = UpdateProgressWindow()
+        background_mode = _set_windows_background_mode(True)
         # Give the main process a moment to enter its normal Qt shutdown path.
         time.sleep(0.25)
         apply_update(
@@ -317,6 +400,14 @@ def main() -> int:
             restart=False,
             progress=progress_window.update,
         )
+        progress_window.update(96, "Создаём ярлык на рабочем столе…")
+        try:
+            ensure_desktop_shortcut(arguments.install_dir, arguments.executable)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if background_mode:
+            _set_windows_background_mode(False)
+            background_mode = False
         if arguments.lock_file is not None:
             arguments.lock_file.unlink(missing_ok=True)
         if not arguments.no_restart:
@@ -333,6 +424,8 @@ def main() -> int:
         _show_error(str(error))
         return 1
     finally:
+        if background_mode:
+            _set_windows_background_mode(False)
         if progress_window is not None:
             progress_window.close()
         if arguments is not None:

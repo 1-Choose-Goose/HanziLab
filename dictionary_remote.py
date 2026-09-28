@@ -73,9 +73,16 @@ def enabled() -> bool:
     return bool(configuration().get("url"))
 
 
-def _post_json(url: str, token: str, operation: str, parameters: dict, context):
+def _post_json(
+    url: str,
+    token: str,
+    operation: str,
+    parameters: dict,
+    context,
+    host_header: str = "",
+):
     parsed = urlsplit(url)
-    key = (parsed.hostname, parsed.port or 443, id(context))
+    key = (parsed.hostname, parsed.port or 443, id(context), host_header)
     holder = getattr(_THREAD_CONNECTION, "holder", None)
     if holder is None or holder[0] != key:
         if holder is not None:
@@ -88,15 +95,18 @@ def _post_json(url: str, token: str, operation: str, parameters: dict, context):
     connection = holder[1]
     path = parsed.path.rstrip("/") + "/v1/" + operation
     body = json.dumps(parameters).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Content-Length": str(len(body)),
+        "Authorization": "Bearer " + token,
+    }
+    if host_header:
+        headers["Host"] = host_header
     connection.request(
         "POST",
         path,
         body=body,
-        headers={
-            "Content-Type": "application/json",
-            "Content-Length": str(len(body)),
-            "Authorization": "Bearer " + token,
-        },
+        headers=headers,
     )
     response = connection.getresponse()
     payload = response.read()
@@ -118,7 +128,14 @@ def call(operation: str, **parameters):
     context = _ssl_context(ca_file)
     for attempt in range(2):
         try:
-            return _post_json(url, config["token"], operation, parameters, context)
+            return _post_json(
+                url,
+                config["token"],
+                operation,
+                parameters,
+                context,
+                config.get("host_header", ""),
+            )
         except (
             HTTPException,
             URLError,

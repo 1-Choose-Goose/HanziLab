@@ -248,6 +248,48 @@ class ApplyUpdateTests(unittest.TestCase):
                 updater._safe_extract(archive, root / "staging")
             self.assertFalse((root / "outside.txt").exists())
 
+    def test_extract_reports_real_progress(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            archive = root / "update.zip"
+            with zipfile.ZipFile(archive, "w") as package:
+                package.writestr("first.bin", b"a" * 100)
+                package.writestr("second.bin", b"b" * 100)
+            updates_reported = []
+
+            updater._safe_extract(
+                archive,
+                root / "staging",
+                progress=lambda value, _text: updates_reported.append(value),
+            )
+
+            self.assertEqual(updates_reported[-1], 55)
+            self.assertTrue((root / "staging" / "second.bin").is_file())
+
+    def test_desktop_shortcut_is_created_without_console(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            install = root / "HanziLab"
+            install.mkdir()
+            (install / "HanziLab.exe").write_bytes(b"exe")
+            desktop = root / "Desktop"
+            desktop.mkdir()
+            with (
+                patch.object(updater, "_desktop_directory", return_value=desktop),
+                patch.object(updater.subprocess, "run") as run,
+            ):
+                shortcut = updater.ensure_desktop_shortcut(install, "HanziLab.exe")
+
+            self.assertEqual(shortcut, desktop / "HanziLab.lnk")
+            command = run.call_args.args[0]
+            self.assertEqual(command[:3], ["wscript.exe", "//B", "//NoLogo"])
+            self.assertTrue(run.call_args.kwargs["check"])
+            self.assertTrue(
+                run.call_args.kwargs["creationflags"]
+                & subprocess_create_no_window()
+            )
+            self.assertFalse(Path(command[3]).exists())
+
     def test_failed_restart_rolls_back_program_and_user_data(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

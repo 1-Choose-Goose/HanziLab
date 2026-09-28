@@ -30,9 +30,18 @@ jobs:
         shell: pwsh
         env:
           SERVER_CONFIG: ${{ secrets.DICTIONARY_SERVER_JSON_B64 }}
+          SERVER_CA_CERTIFICATE: ${{ secrets.DICTIONARY_SERVER_CA_PEM_B64 }}
         run: |
-          if ($env:SERVER_CONFIG) {
-            [IO.File]::WriteAllBytes("dictionary-server.json", [Convert]::FromBase64String($env:SERVER_CONFIG))
+          if (-not $env:SERVER_CONFIG) {
+            throw "The DICTIONARY_SERVER_JSON_B64 secret is required to build a server-connected release"
+          }
+          [IO.File]::WriteAllBytes("dictionary-server.json", [Convert]::FromBase64String($env:SERVER_CONFIG))
+          $config = Get-Content dictionary-server.json -Raw | ConvertFrom-Json
+          if ($config.ca_file) {
+            if (-not $env:SERVER_CA_CERTIFICATE) {
+              throw "The DICTIONARY_SERVER_CA_PEM_B64 secret is required by dictionary-server.json"
+            }
+            [IO.File]::WriteAllBytes($config.ca_file, [Convert]::FromBase64String($env:SERVER_CA_CERTIFICATE))
           }
 
       - name: Verify tag matches application version
@@ -58,7 +67,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path release -Force | Out-Null
-          Compress-Archive -Path dist\HanziLab\* -DestinationPath release\HanziLab-Windows-x64.zip -CompressionLevel Optimal
+          Compress-Archive -Path dist\HanziLab\* -DestinationPath release\HanziLab-Windows-x64.zip -CompressionLevel Fastest
 
       - uses: actions/upload-artifact@v4
         with:

@@ -9,7 +9,6 @@ import unicodedata
 from functools import cache
 from pathlib import Path
 
-from pypinyin import Style, lazy_pinyin
 from PySide6.QtCore import (
     QEvent,
     QObject,
@@ -82,6 +81,7 @@ APP_ICON_PNG = ICON_DIR / (
     "hanzilab-macos.png" if sys.platform == "darwin" else "hanzilab.png"
 )
 APP_ICON_ICO = ICON_DIR / "hanzilab.ico"
+APP_ICON_FILE = APP_ICON_ICO if sys.platform == "win32" else APP_ICON_PNG
 SPINBOX_PLUS_ICON = ICON_DIR / "spinbox-plus.svg"
 SPINBOX_MINUS_ICON = ICON_DIR / "spinbox-minus.svg"
 SIDEBAR_DROPDOWN_ICON = ICON_DIR / "dropdown-triangle-light.svg"
@@ -336,23 +336,15 @@ def readable_pinyin(hanzi: str, pinyin: str) -> str:
     hanzi_characters = CJK_RE.findall(hanzi)
     if " " in value or len(hanzi_characters) < 2:
         return value
-    generated_bases = [
-        normalized
-        for syllable in lazy_pinyin(
-            hanzi, style=Style.TONE, neutral_tone_with_five=False
-        )
-        if (normalized := _pinyin_base(syllable))
-    ]
-    if _pinyin_base(value) != "".join(generated_bases):
-        syllable_count = len(hanzi_characters)
-        if hanzi_characters[-1] == "儿" and _pinyin_base(value).endswith("r"):
-            syllable_count -= 1
-        generated_bases = _split_compact_pinyin(value, syllable_count) or []
+    syllable_count = len(hanzi_characters)
+    if hanzi_characters[-1] == "儿" and _pinyin_base(value).endswith("r"):
+        syllable_count -= 1
+    generated_bases = _split_compact_pinyin(value, syllable_count) or []
     if not generated_bases:
         return value
 
-    # Границы берём из pypinyin, но сами слоги вырезаем из сохранённого
-    # чтения: так не теряются словарные тоны (например 一: yī вместо yí).
+    # Границы берём из лёгкого локального списка слогов, а текст
+    # вырезаем из сохранённого чтения, чтобы не терять словарные тоны.
     source = unicodedata.normalize("NFC", value)
     position = 0
     separated: list[str] = []
@@ -472,7 +464,7 @@ class CopybookCollectionDialog(QDialog):
         self.hanzi_font_family = hanzi_font_family
         self.setObjectName("copybookCollectionDialog")
         self.setWindowTitle("Собрать прописи")
-        self.setWindowIcon(QIcon(str(APP_ICON_PNG)))
+        self.setWindowIcon(QIcon(str(APP_ICON_FILE)))
         self.setFont(QFont(RUSSIAN_FONT_FAMILY, 10))
         self.resize(850, 610)
         self.setMinimumSize(700, 520)
@@ -849,7 +841,7 @@ class HanziLabWindow(QMainWindow):
             saved_font = self.settings.value("hanzi_font", KAITI_FAMILY, type=str)
         self.hanzi_font_family = saved_font if saved_font in {KAITI_FAMILY, XINGSHU_FAMILY} else KAITI_FAMILY
         self.setWindowTitle(APP_TITLE)
-        self.setWindowIcon(QIcon(str(APP_ICON_PNG)))
+        self.setWindowIcon(QIcon(str(APP_ICON_FILE)))
         self.resize(1180, 780)
         self.setMinimumSize(900, 640)
 
@@ -2257,6 +2249,10 @@ QPushButton#cardListCloseButton:pressed { background: #B44334; }
 QPushButton#cardListResumeButton { background: #FFFFFF; color: #425159; border: 1px solid #D7DEE1; border-radius: 9px; padding: 10px 14px; font-weight: 600; }
 QPushButton#cardListResumeButton:hover { background: #FFF1ED; color: #C94D3C; border-color: #E8B5AC; }
 QPushButton#cardListResumeButton:disabled { background: #F2F4F5; color: #A8B1B5; }
+QPushButton#cardListDeleteSelected, QPushButton#cardListDeleteAll { background: #FFFFFF; color: #B44334; border: 1px solid #E3B2AA; border-radius: 9px; padding: 10px 13px; font-weight: 600; }
+QPushButton#cardListDeleteSelected:hover, QPushButton#cardListDeleteAll:hover { background: #FFF1ED; border-color: #D98F83; }
+QPushButton#cardListDeleteSelected:pressed, QPushButton#cardListDeleteAll:pressed { background: #FADFD9; }
+QPushButton#cardListDeleteSelected:disabled, QPushButton#cardListDeleteAll:disabled { background: #F2F4F5; color: #A8B1B5; border-color: #D7DEE1; }
 QDialog#manualCardDialog { background: #F7F9FA; }
 QLabel#manualCardTitle { color: #182026; font-size: 20px; font-weight: 700; }
 QLabel#manualCardSubtitle { color: #6E7C83; font-size: 12px; }
@@ -2376,7 +2372,7 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("HanziLab")
     app.setOrganizationName("HanziLab")
-    app.setWindowIcon(QIcon(str(APP_ICON_PNG)))
+    app.setWindowIcon(QIcon(str(APP_ICON_FILE)))
     window_centering_filter = WindowCenteringFilter(app)
     app.installEventFilter(window_centering_filter)
     if smoke_test:

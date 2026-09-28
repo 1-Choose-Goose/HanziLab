@@ -1130,6 +1130,8 @@ class SpacedRepetitionSettingsDialog(QDialog):
 
 
 class CardListDialog(QDialog):
+    cards_deleted = Signal(object)
+
     def __init__(
         self,
         repository: StudyRepository,
@@ -1151,17 +1153,18 @@ class CardListDialog(QDialog):
 
         heading = QLabel("Все карточки")
         heading.setObjectName("cardListTitle")
-        count = QLabel(f"Сохранено карточек: {len(self.cards)}")
-        count.setObjectName("cardListCount")
+        self.count_label = QLabel()
+        self.count_label.setObjectName("cardListCount")
+        self.update_count_label()
         layout.addWidget(heading)
-        layout.addWidget(count)
+        layout.addWidget(self.count_label)
 
         self.table = QTableWidget(len(self.cards), 4)
         self.table.setObjectName("cardListTable")
         self.table.setHorizontalHeaderLabels(("Слово", "Пиньинь", "Перевод", "Состояние"))
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setDefaultSectionSize(48)
         header = self.table.horizontalHeader()
@@ -1195,7 +1198,17 @@ class CardListDialog(QDialog):
         self.resume_button.setObjectName("cardListResumeButton")
         self.resume_button.setEnabled(False)
         self.resume_button.clicked.connect(self.resume_selected_card)
-        self.table.itemSelectionChanged.connect(self.update_resume_button)
+        self.delete_selected_button = QPushButton("Удалить выбранные")
+        self.delete_selected_button.setObjectName("cardListDeleteSelected")
+        self.delete_selected_button.setEnabled(False)
+        self.delete_selected_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.delete_selected_button.clicked.connect(self.delete_selected_cards)
+        self.delete_all_button = QPushButton("Удалить все")
+        self.delete_all_button.setObjectName("cardListDeleteAll")
+        self.delete_all_button.setEnabled(bool(self.cards))
+        self.delete_all_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.delete_all_button.clicked.connect(self.delete_all_cards)
+        self.table.itemSelectionChanged.connect(self.update_action_buttons)
         close_button = QPushButton("Закрыть")
         close_button.setObjectName("cardListCloseButton")
         close_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1203,14 +1216,34 @@ class CardListDialog(QDialog):
         actions = QHBoxLayout()
         actions.addWidget(self.resume_button)
         actions.addStretch()
+        actions.addWidget(self.delete_selected_button)
+        actions.addWidget(self.delete_all_button)
         actions.addWidget(close_button)
         layout.addLayout(actions)
 
-    def update_resume_button(self) -> None:
-        row = self.table.currentRow()
+    def selected_rows(self) -> list[int]:
+        return sorted(
+            {index.row() for index in self.table.selectionModel().selectedRows()}
+        )
+
+    def update_count_label(self) -> None:
+        self.count_label.setText(f"Сохранено карточек: {len(self.cards)}")
+
+    def update_action_buttons(self) -> None:
+        rows = self.selected_rows()
+        row = rows[0] if len(rows) == 1 else -1
         self.resume_button.setEnabled(
             0 <= row < len(self.cards) and self.cards[row].is_suspended
         )
+        self.delete_selected_button.setEnabled(bool(rows))
+        self.delete_selected_button.setText(
+            f"Удалить выбранные · {len(rows)}"
+            if rows
+            else "Удалить выбранные"
+        )
+
+    def update_resume_button(self) -> None:
+        self.update_action_buttons()
 
     def resume_selected_card(self) -> None:
         row = self.table.currentRow()
@@ -1220,7 +1253,57 @@ class CardListDialog(QDialog):
         self.repository.set_card_suspended(card.id, False)
         self.cards[row] = replace(card, is_suspended=False)
         self.table.item(row, 3).setText("Трудная" if card.is_leech else "Обычная")
-        self.update_resume_button()
+        self.update_action_buttons()
+
+    def delete_selected_cards(self) -> None:
+        rows = self.selected_rows()
+        if not rows:
+            return
+        count = len(rows)
+        answer = QMessageBox.question(
+            self,
+            "Удалить карточки?",
+            f"Удалить выбранные карточки: {count}?\n"
+            "Их история и расписание тоже будут удалены.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        selected_cards = [self.cards[row] for row in rows]
+        if not self.repository.remove_cards(card.id for card in selected_cards):
+            return
+        for row in reversed(rows):
+            self.table.removeRow(row)
+            del self.cards[row]
+        self.update_count_label()
+        self.delete_all_button.setEnabled(bool(self.cards))
+        self.update_action_buttons()
+        self.cards_deleted.emit(tuple(card.hanzi for card in selected_cards))
+
+    def delete_all_cards(self) -> None:
+        if not self.cards:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Удалить все карточки?",
+            f"Будут удалены все карточки: {len(self.cards)}.\n"
+            "Их история и расписание тоже будут удалены.\n"
+            "Это действие нельзя отменить.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        deleted = tuple(card.hanzi for card in self.cards)
+        if not self.repository.remove_all_cards():
+            return
+        self.cards.clear()
+        self.table.setRowCount(0)
+        self.update_count_label()
+        self.delete_all_button.setEnabled(False)
+        self.update_action_buttons()
+        self.cards_deleted.emit(deleted)
 
 
 class StudyPage(QWidget):
@@ -1711,6 +1794,7 @@ class StudyPage(QWidget):
             self.russian_font_family,
             self,
         )
+        dialog.cards_deleted.connect(self.cards_were_removed)
         dialog.exec()
 
     def show_scheduler_settings(self) -> None:
@@ -1804,6 +1888,15 @@ class StudyPage(QWidget):
             self.invalidate_examples()
             self.current_item = None
         self.refresh()
+
+    def cards_were_removed(self, hanzi_values: object) -> None:
+        removed = {str(hanzi) for hanzi in hanzi_values}
+        if self.current_item and self.current_item.card.hanzi in removed:
+            self.invalidate_examples()
+            self.current_item = None
+        self.session.invalidate_daily_priority(utc_now())
+        self.refresh()
+        self.cards_changed.emit()
 
     def load_next_card(self, now=None) -> None:
         now = now or utc_now()

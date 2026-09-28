@@ -1,4 +1,4 @@
 """Single source of truth for application and release versions."""
 
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 

@@ -7,6 +7,7 @@ from functools import lru_cache
 from itertools import pairwise
 
 import stroke_order
+from asset_store import iter_asset_paths
 
 Point = tuple[float, float]
 Stroke = Sequence[Point]
@@ -109,8 +110,10 @@ def _distance(first: tuple[bytes, ...], second: tuple[bytes, ...]) -> float:
 def handwriting_index() -> dict[int, tuple[tuple[str, tuple[bytes, ...]], ...]]:
     """Build a compact offline index from the bundled stroke medians."""
     grouped: dict[int, list[tuple[str, tuple[bytes, ...]]]] = {}
-    for path in stroke_order.STROKE_DATA_DIR.glob("*.json"):
-        character = path.stem
+    for asset_name in iter_asset_paths(stroke_order.STROKE_DATA_DIR, ".json"):
+        if "/" in asset_name or "\\" in asset_name:
+            continue
+        character = asset_name[:-5]
         if len(character) != 1:
             continue
         data = stroke_order.load_character_data(character)

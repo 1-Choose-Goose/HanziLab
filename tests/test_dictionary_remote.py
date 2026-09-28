@@ -247,6 +247,47 @@ class RemoteDictionaryTests(unittest.TestCase):
         self.assertEqual(connection.requests, 2)
         dictionary_remote._THREAD_CONNECTION.holder = None
 
+    def test_json_request_can_target_a_separate_api_virtual_host(self):
+        class Response:
+            status = 200
+
+            @staticmethod
+            def read():
+                return b'{"entries": 1}'
+
+        class Connection:
+            request_args = None
+
+            def request(self, *args, **kwargs):
+                self.request_args = (args, kwargs)
+
+            @staticmethod
+            def getresponse():
+                return Response()
+
+            @staticmethod
+            def close():
+                pass
+
+        connection = Connection()
+        dictionary_remote._THREAD_CONNECTION.holder = None
+        with patch.object(
+            dictionary_remote, "HTTPSConnection", return_value=connection
+        ):
+            dictionary_remote._post_json(
+                "https://choose-goose.ru",
+                "token",
+                "stats",
+                {},
+                object(),
+                "178.217.99.218",
+            )
+
+        self.assertEqual(
+            connection.request_args[1]["headers"]["Host"], "178.217.99.218"
+        )
+        dictionary_remote._THREAD_CONNECTION.holder = None
+
     def test_network_failure_has_actionable_message(self):
         with patch.object(dictionary_remote, "configuration", return_value={"url": "https://example.test", "token": "test"}), patch.object(dictionary_remote, "_post_json", side_effect=TimeoutError), self.assertRaisesRegex(RuntimeError, "Проверьте подключение"):
             dictionary_remote.call("stats")

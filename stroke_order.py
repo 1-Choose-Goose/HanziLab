@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from asset_store import read_asset_text
+
 ROOT = Path(__file__).resolve().parent
 STROKE_DATA_DIR = ROOT / "assets" / "strokes"
 
@@ -35,10 +37,8 @@ STROKE_DATA_DIR = ROOT / "assets" / "strokes"
 def load_character_data(character: str) -> dict | None:
     if len(character) != 1 or character in '/\\:' or ord(character) < 32:
         return None
-    path = STROKE_DATA_DIR / f"{character}.json"
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        data = json.loads(read_asset_text(STROKE_DATA_DIR, f"{character}.json"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict):

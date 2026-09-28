@@ -7,6 +7,18 @@ Set-Location -LiteralPath $PSScriptRoot
 $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 $distribution = Join-Path $OutputRoot "HanziLab"
 
+$serverConfigPath = Join-Path $PSScriptRoot "dictionary-server.json"
+if (-not (Test-Path -LiteralPath $serverConfigPath)) {
+    throw "Release configuration is missing: dictionary-server.json"
+}
+$serverConfig = Get-Content -LiteralPath $serverConfigPath -Raw | ConvertFrom-Json
+if (-not $serverConfig.url -or -not $serverConfig.token) {
+    throw "Release configuration must include the dictionary server URL and token"
+}
+if ($serverConfig.ca_file -and -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $serverConfig.ca_file))) {
+    throw "Release CA certificate is missing: $($serverConfig.ca_file)"
+}
+
 python -m PyInstaller --noconfirm --clean --distpath $OutputRoot HanziLab.spec
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller failed with exit code $LASTEXITCODE"

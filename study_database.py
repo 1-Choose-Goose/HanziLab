@@ -274,6 +274,10 @@ class StudyRepository:
         connection = sqlite3.connect(self.database)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
+        # WAL + NORMAL keeps transactions durable against application crashes
+        # without forcing a full disk flush for every UI action.
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA busy_timeout=3000")
         return connection
 
     def add_card(self, hanzi: str, pinyin: str, translation: str) -> bool:
@@ -386,6 +390,25 @@ class StudyRepository:
                 "DELETE FROM cards WHERE hanzi = ?", (hanzi,)
             )
             return cursor.rowcount == 1
+
+    def remove_cards(self, card_ids: Iterable[int]) -> int:
+        """Атомарно удаляет выбранные карточки и все связанные данные."""
+        unique_ids = tuple(dict.fromkeys(int(card_id) for card_id in card_ids))
+        if not unique_ids:
+            return 0
+        placeholders = ",".join("?" for _card_id in unique_ids)
+        with closing(self.connect()) as connection, connection:
+            cursor = connection.execute(
+                f"DELETE FROM cards WHERE id IN ({placeholders})",
+                unique_ids,
+            )
+            return cursor.rowcount
+
+    def remove_all_cards(self) -> int:
+        """Удаляет все карточки и связанную историю одной транзакцией."""
+        with closing(self.connect()) as connection, connection:
+            cursor = connection.execute("DELETE FROM cards")
+            return cursor.rowcount
 
     def get_card(self, card_id: int) -> CardState | None:
         with closing(self.connect()) as connection:

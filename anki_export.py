@@ -7,8 +7,6 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Protocol
 
-import genanki
-
 DIRECT_MODEL_ID = 1938475622
 REVERSE_MODEL_ID = 1938475623
 DECK_ID = 2059440712
@@ -93,6 +91,8 @@ def _html_field(value: str) -> str:
 
 def export_anki_package(cards: Iterable[ExportableCard], path: str | Path) -> int:
     """Create an .apkg with HanziLab's fields, card template and styling."""
+    import genanki
+
     fields = [
         {"name": "Hanzi"},
         {"name": "Pinyin"},
