@@ -254,7 +254,9 @@ def launch_updater(archive: Path) -> None:
     updater = updater_dir / UPDATER_NAME
     shutil.copy2(source_updater, updater)
     lock_file = update_lock_path()
-    creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) | getattr(
+        subprocess, "DETACHED_PROCESS", 0x00000008
+    )
     try:
         _write_update_lock(lock_file, os.getpid())
         subprocess.Popen(

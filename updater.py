@@ -18,6 +18,7 @@ from pathlib import Path
 
 PRESERVED_ITEMS = ("data", "dictionary-server.json", "dictionary-server-ca.pem")
 ProgressCallback = Callable[[int, str], None]
+_NATIVE_PATH = type(Path())
 
 
 class ApplyUpdateError(RuntimeError):
@@ -204,7 +205,7 @@ def ensure_desktop_shortcut(install_dir: Path, executable: str) -> Path:
             ["wscript.exe", "//B", "//NoLogo", str(script)],
             check=True,
             close_fds=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
         )
     finally:
         script.unlink(missing_ok=True)
@@ -325,9 +326,12 @@ def _schedule_self_cleanup() -> None:
     """Delete the copied one-file updater after this process releases it."""
     if os.name != "nt" or not getattr(sys, "frozen", False):
         return
-    executable = Path(sys.executable).resolve()
+    # ``sys.executable`` and ``tempfile.gettempdir()`` are absolute in frozen
+    # builds. Avoid ``Path.resolve()`` here because a Windows-mode unit test
+    # also runs on macOS, where pathlib cannot resolve with Windows semantics.
+    executable = _NATIVE_PATH(os.path.realpath(sys.executable))
     folder = executable.parent
-    temporary_root = Path(tempfile.gettempdir()).resolve()
+    temporary_root = _NATIVE_PATH(os.path.realpath(tempfile.gettempdir()))
     if temporary_root not in folder.parents or not folder.name.startswith(
         "HanziLab-updater-"
     ):
@@ -338,7 +342,10 @@ def _schedule_self_cleanup() -> None:
         prefix="HanziLab-cleanup-", suffix=".cmd", dir=temporary_root
     )
     cleanup_script = Path(cleanup_name)
-    with os.fdopen(descriptor, "w", encoding="mbcs", newline="\r\n") as script:
+    cleanup_encoding = "mbcs" if sys.platform == "win32" else "utf-8"
+    with os.fdopen(
+        descriptor, "w", encoding=cleanup_encoding, newline="\r\n"
+    ) as script:
         script.write(
             "@echo off\n"
             "for /l %%i in (1,1,60) do (\n"
@@ -349,7 +356,9 @@ def _schedule_self_cleanup() -> None:
             ":cleanup_done\n"
             'del /f /q "%~f0"\n'
         )
-    creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) | getattr(
+        subprocess, "CREATE_NO_WINDOW", 0x08000000
+    )
     try:
         subprocess.Popen(
             ["cmd.exe", "/d", "/c", str(cleanup_script)],
