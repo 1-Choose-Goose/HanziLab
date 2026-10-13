@@ -345,16 +345,22 @@ def check_dictionary_download() -> None:
     if download.get("provider") != "yandex_disk" or not public_url or not password:
         raise RuntimeError("Источник загрузки словаря не настроен")
     context = _ssl_context("")
-    download_url = _resolve_yandex_download(public_url, password, context)
-    request = Request(
-        download_url,
-        headers={"User-Agent": "HanziLab", "Range": "bytes=0-15"},
-    )
-    try:
-        with urlopen(request, timeout=30, context=context) as response:
-            if response.read(16) != b"SQLite format 3\x00":
-                raise RuntimeError("Яндекс Диск вернул повреждённый файл словаря.")
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
-        raise RuntimeError(
-            "Не удалось проверить словарь на Яндекс Диске."
-        ) from error
+    last_error: Exception | None = None
+    for _attempt in range(3):
+        try:
+            download_url = _resolve_yandex_download(public_url, password, context)
+            request = Request(
+                download_url,
+                headers={"User-Agent": "HanziLab", "Range": "bytes=0-15"},
+            )
+            with urlopen(request, timeout=30, context=context) as response:
+                if response.read(16) != b"SQLite format 3\x00":
+                    raise RuntimeError(
+                        "Яндекс Диск вернул повреждённый файл словаря."
+                    )
+            return
+        except RuntimeError:
+            raise
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
+            last_error = error
+    raise RuntimeError("Не удалось проверить словарь на Яндекс Диске.") from last_error

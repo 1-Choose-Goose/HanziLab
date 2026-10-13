@@ -96,6 +96,34 @@ class RemoteDictionaryTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), payload)
             self.assertFalse(destination.with_name("hanzi.db.download").exists())
 
+    def test_download_check_retries_transient_connection_failures(self):
+        class Response(io.BytesIO):
+            pass
+
+        config = {
+            "download": {
+                "provider": "yandex_disk",
+                "public_url": "https://disk.yandex.ru/d/test",
+                "password": "secret",
+            }
+        }
+        response = Response(b"SQLite format 3\x00")
+        with (
+            patch.object(dictionary_remote, "configuration", return_value=config),
+            patch.object(
+                dictionary_remote,
+                "_resolve_yandex_download",
+                side_effect=[
+                    TimeoutError("first"),
+                    TimeoutError("second"),
+                    "https://downloader.test/hanzi.db",
+                ],
+            ) as resolve,
+            patch.object(dictionary_remote, "urlopen", return_value=response),
+        ):
+            dictionary_remote.check_dictionary_download()
+        self.assertEqual(resolve.call_count, 3)
+
     def test_download_rejects_header_only_database_and_preserves_installed_file(self):
         class Response(io.BytesIO):
             def __init__(self, value: bytes):
