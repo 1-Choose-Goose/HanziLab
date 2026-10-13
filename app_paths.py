@@ -37,7 +37,16 @@ def default_user_data_dir(
         return Path(override).expanduser().resolve()
     if platform == "darwin":
         if frozen:
-            return home / "Library" / "Application Support" / APP_NAME
+            executable = executable.resolve()
+            app_bundle = next(
+                (parent for parent in executable.parents if parent.suffix == ".app"),
+                None,
+            )
+            container = app_bundle.parent if app_bundle else executable.parent
+            project_data = container.parent / "data"
+            if container.name == "dist" and project_data.is_dir():
+                return project_data
+            return container / "data"
         return source_root / "data"
     if platform == "win32":
         # Preserve the portable Windows layout used by existing releases.
