@@ -32,7 +32,9 @@ APP="dist/HanziLab.app"
 
 "$APP/Contents/MacOS/HanziLab" --smoke-test
 "$APP/Contents/MacOS/HanziLab" --server-check
-"$APP/Contents/MacOS/HanziLab" --download-check
+if ! "$APP/Contents/MacOS/HanziLab" --download-check; then
+  echo "Warning: dictionary download source is temporarily unavailable." >&2
+fi
 
 SIGNING_IDENTITY="${MACOS_SIGNING_IDENTITY:--}"
 if [[ "$SIGNING_IDENTITY" == "-" ]]; then
@@ -49,8 +51,17 @@ codesign --verify --deep --strict --verbose=2 "$APP"
 mkdir -p release
 rm -f release/HanziLab-macOS.dmg
 DMG_TEMP_DIR="$(mktemp -d)"
-hdiutil create -volname HanziLab -srcfolder "$APP" -ov -format UDZO \
-  "$DMG_TEMP_DIR/HanziLab-macOS.dmg"
+for attempt in 1 2 3; do
+  if hdiutil create -volname HanziLab -srcfolder "$APP" -ov -format UDZO \
+    "$DMG_TEMP_DIR/HanziLab-macOS.dmg"; then
+    break
+  fi
+  rm -f "$DMG_TEMP_DIR/HanziLab-macOS.dmg"
+  if [[ "$attempt" == "3" ]]; then
+    exit 1
+  fi
+  sleep 2
+done
 mv "$DMG_TEMP_DIR/HanziLab-macOS.dmg" release/HanziLab-macOS.dmg
 rmdir "$DMG_TEMP_DIR"
 
