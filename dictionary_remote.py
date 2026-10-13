@@ -126,7 +126,7 @@ def call(operation: str, **parameters):
         else ""
     )
     context = _ssl_context(ca_file)
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             return _post_json(
                 url,
@@ -147,7 +147,7 @@ def call(operation: str, **parameters):
             if holder is not None:
                 holder[1].close()
             _THREAD_CONNECTION.holder = None
-            if attempt:
+            if attempt == 2:
                 raise RuntimeError("Сервер словаря недоступен. Проверьте подключение к интернету и повторите запрос.") from error
 
 

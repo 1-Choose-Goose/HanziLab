@@ -289,8 +289,9 @@ class RemoteDictionaryTests(unittest.TestCase):
         dictionary_remote._THREAD_CONNECTION.holder = None
 
     def test_network_failure_has_actionable_message(self):
-        with patch.object(dictionary_remote, "configuration", return_value={"url": "https://example.test", "token": "test"}), patch.object(dictionary_remote, "_post_json", side_effect=TimeoutError), self.assertRaisesRegex(RuntimeError, "Проверьте подключение"):
+        with patch.object(dictionary_remote, "configuration", return_value={"url": "https://example.test", "token": "test"}), patch.object(dictionary_remote, "_post_json", side_effect=TimeoutError) as request, self.assertRaisesRegex(RuntimeError, "Проверьте подключение"):
             dictionary_remote.call("stats")
+        self.assertEqual(request.call_count, 3)
 
 
 if __name__ == "__main__":
