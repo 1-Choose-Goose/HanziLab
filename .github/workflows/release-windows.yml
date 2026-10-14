@@ -57,7 +57,7 @@ jobs:
         shell: pwsh
         run: |
           $env:HANZILAB_DICTIONARY_LOCAL = "1"
-          python -m unittest discover -s tests -v
+          python -m scripts.ci_test_runner
 
       - name: Build Windows application
         shell: pwsh
