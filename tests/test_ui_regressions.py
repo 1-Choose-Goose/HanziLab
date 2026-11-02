@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication, QLabel
 
 import desktop
@@ -130,6 +131,23 @@ class UiRegressionTests(unittest.TestCase):
         finally:
             window.close()
             window.deleteLater()
+            row.deleteLater()
+
+    def test_dictionary_result_hanzi_uses_crisp_native_font_rendering(self):
+        row = desktop.ResultRow({
+            "hanzi": "学校", "pinyin": "xué xiào", "translation": "школа",
+        })
+        try:
+            font = row.findChild(QLabel, "resultHanzi").font()
+            self.assertEqual(font.weight(), QFont.Weight.Normal)
+            self.assertEqual(
+                font.hintingPreference(),
+                QFont.HintingPreference.PreferFullHinting,
+            )
+            self.assertTrue(
+                font.styleStrategy() & QFont.StyleStrategy.PreferQuality
+            )
+        finally:
             row.deleteLater()
 
     def test_cursive_catalogue_is_created_only_when_opened(self):

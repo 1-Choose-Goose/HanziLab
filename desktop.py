@@ -424,7 +424,10 @@ class ResultRow(QWidget):
         hanzi.setObjectName("resultHanzi")
         character_count = len(CJK_RE.findall(hanzi_text))
         hanzi_size = 16 if character_count <= 4 else 14 if character_count <= 6 else 12
-        hanzi.setFont(QFont(hanzi_font_family, hanzi_size, QFont.Weight.DemiBold))
+        hanzi_font = QFont(hanzi_font_family, hanzi_size, QFont.Weight.Normal)
+        hanzi_font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+        hanzi_font.setStyleStrategy(QFont.StyleStrategy.PreferQuality)
+        hanzi.setFont(hanzi_font)
         hanzi.setFixedWidth(120)
         hanzi.setMaximumHeight(58)
         hanzi.setWordWrap(True)
